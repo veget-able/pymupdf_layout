@@ -29,7 +29,7 @@
 #include "tgif_runtime.h"
 #include "visual-table.h"
 
-#define DEBUG_VISUAL_GRID_FINDER
+//#define DEBUG_VISUAL_GRID_FINDER
 
 static void *fz_malloc_no_throw_wrap(void *opaque, size_t size)
 {

@@ -245,7 +245,8 @@ p = pipcl.Package(
         description_content_type = 'text/markdown',
         license = 'Dual Licensed - Polyform Noncommercial or Artifex Commercial License',
         project_url = [
-                ('Documentation, https://pymupdf.readthedocs.io/en/latest/pymupdf-layout/')
+                'Documentation, https://pymupdf.readthedocs.io/en/latest/pymupdf-layout/',
+                'Source, https://github.com/ArtifexSoftware/pymupdf_layout',
                 ],
         classifier = [
                 'Development Status :: 5 - Production/Stable',
@@ -284,11 +285,9 @@ def get_requires_for_build_wheel(config_settings=None):
         pipcl.log(f'{pymupdf_version_override=}')
         ret.append(f'pymupdf=={pymupdf_version_override or g_pymupdf_version}')
     
-    python_version_tuple = tuple(int(x) for x in platform.python_version_tuple()[:2])
-    
     if PYMUPDF_LAYOUT_SETUP_SWIG:
         pass
-    elif pipcl.darwin() and python_version_tuple < (3, 13):
+    elif pipcl.darwin() and pipcl.python_version_tuple() < (3, 13):
         # 2025-10-27: new swig-4.4.0 fails badly at runtime.
         # Note that we must use the same version of swig as pymupdf, otherwise
         # our tgif extension module will not know about pymupdf.mupdf's types.

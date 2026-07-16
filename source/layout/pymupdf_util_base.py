@@ -363,7 +363,7 @@ def text_extract(data_dict, box_type, page_width, page_height, blocks):
             txt = ' '.join(txt).strip()
 
             # Filter Empty text
-            if txt != '' and 0 <= x1 < x2 <= page_width and 0 <= y1 < y2 <= page_height:
+            if txt != '' and 0 <= x2 and x1 <= x2 and x1 <= page_width and 0 <= y2 and y1 <= y2 and y1 <= page_height:
                 bbox = [x1, y1, x2, y2]
                 if bbox not in data_dict['bboxes']:
                     data_dict['bboxes'].append(bbox)

@@ -62,6 +62,17 @@ def create_input_data_from_page(page, options=None):
         _ensure_custom_features(data_dict)
         return data_dict
 
+    debug_extraction = False
+    if debug_extraction:
+        print("EXTRACTED BBOXES")
+        list = zip(data_dict['bboxes'], data_dict['box_type'], data_dict['text'])
+        for i, info in enumerate(list):
+            bbox = info[0]
+            t = info[1]
+            txt = info[2]
+            print(f'{i}: [{bbox[0]} {bbox[1]} {bbox[2]} {bbox[3]}] {t} "{txt}"')
+        print("END OF BBOXES")
+
     # Step 2: Apply feature extractors (if requested)
     if feature_set_name:
         # Prepare page_dict for YF features if needed
@@ -83,6 +94,22 @@ def create_input_data_from_page(page, options=None):
         )
     else:
         _ensure_custom_features(data_dict)
+
+    export_markedup_image = False
+    if export_markedup_image:
+        import pprint
+        pprint.pp(data_dict)
+
+        newdoc = pymupdf.open(page.parent.name)
+        newpage = newdoc[page.number]
+        data = zip(data_dict['bboxes'], data_dict['box_type'])
+        RED=(1,0,0)
+        for i, info in enumerate(data):
+            bbox = info[0]
+            name = info[1]
+            newpage.draw_rect(bbox, color=RED, width=1)
+            newpage.insert_text(bbox[2:], f"{i}: {name}", color=RED, fontsize=5)
+        newdoc.ez_save("layout_input.pdf")
 
     return data_dict
 

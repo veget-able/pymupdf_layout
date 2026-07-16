@@ -452,6 +452,11 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
     stext_page = create_stext_page(page, stext_flags)
     data_dict['stext_page'] = stext_page
 
+    if False:
+        import pprint
+        pprint.pp(input_type)
+        pprint.pp(stext_page.extractDICT())
+
     # Extract images
     if 'image' in input_type:
         img_bboxes = [itm["bbox"] for itm in page.get_image_info()]

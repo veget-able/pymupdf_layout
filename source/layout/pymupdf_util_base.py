@@ -7,6 +7,7 @@ Purpose: Stable PDF element extraction (text, images, vectors, checkboxes)
 import copy
 import numpy as np
 import pymupdf
+from collections import defaultdict
 
 
 def get_vector_lines(page, omit_invisible=True):
@@ -317,6 +318,95 @@ def merge_lines(lines, orientation='h', tolerance=3):
     return merged
 
 
+def find_closed_border_rects(h_lines, v_lines, tol=0.75):
+    """
+    Find fully-closed border rectangles (e.g. full-border tables) using
+    exact coordinate matching -- NOT proximity/tolerance-based clustering
+    like page.cluster_drawings(). See design discussion: clustering's
+    tolerance is itself an unvalidated heuristic, and real tables are built
+    in inconsistent ways (lines-only, filled cells, text-wrapping vectors),
+    so no single tolerance is guaranteed to generalize. Exact-match closure
+    instead only asserts something narrower and more defensible: "these
+    lines were clearly drawn to form a rectangle" -- true regardless of how
+    close together two SEPARATE closed rectangles happen to sit.
+
+    Core idea: a full-border rectangle's outer boundary is formed by two
+    horizontal lines sharing the exact same x-span, and two vertical lines
+    sharing the exact same y-span (the horizontal pair's y-values),
+    positioned at exactly those two x-coordinates.
+
+    Args:
+        h_lines: list of objects with x0, y0, x1, y1 (horizontal lines,
+            y0 == y1 up to float noise). As returned by
+            get_vector_lines()/merge_lines().
+        v_lines: list of objects with x0, y0, x1, y1 (vertical lines,
+            x0 == x1 up to float noise).
+        tol: float. Coordinate-snapping tolerance to absorb float rounding
+            noise ONLY (e.g. two lines both meant to be drawn at x=100.0
+            landing at 100.0 and 100.03) -- NOT a proximity threshold for
+            deciding whether two nearby-but-distinct coordinates should be
+            treated as "close enough" structurally. Keep well below the
+            smallest real gap you'd expect between two genuinely different
+            table/cell edges.
+
+    Returns:
+        list of (x0, y_top, x1, y_bottom) tuples: one closed rectangle per
+        matching horizontal-line x-span/vertical-line y-span pair found.
+        Checks every pair of horizontal lines sharing an x-span (not just
+        the global min/max y for that span), so two separate rectangles
+        that happen to share the same width don't get silently merged into
+        one spanning both.
+    """
+    def snap(v):
+        return round(v / tol) * tol
+
+    h_by_span = defaultdict(list)
+    for r in h_lines:
+        x0, x1 = sorted((r.x0, r.x1))
+        y = (r.y0 + r.y1) / 2.0
+        h_by_span[(snap(x0), snap(x1))].append(y)
+
+    v_by_span = defaultdict(set)
+    for r in v_lines:
+        y0, y1 = sorted((r.y0, r.y1))
+        x = (r.x0 + r.x1) / 2.0
+        v_by_span[(snap(y0), snap(y1))].add(snap(x))
+
+    closed_rects = []
+    for (x0k, x1k), ys in h_by_span.items():
+        if x0k == x1k or len(ys) < 2:
+            continue
+
+        ys_sorted = sorted(set(ys))
+        for a in range(len(ys_sorted)):
+            for b in range(a + 1, len(ys_sorted)):
+                y_top, y_bottom = ys_sorted[a], ys_sorted[b]
+                v_xs = v_by_span.get((snap(y_top), snap(y_bottom)))
+                if v_xs and x0k in v_xs and x1k in v_xs:
+                    closed_rects.append((x0k, y_top, x1k, y_bottom))
+
+    return closed_rects
+
+
+def get_rect_member_id(bbox, closed_rects):
+    """
+    Which closed rect (from find_closed_border_rects) contains this bbox's
+    center, if any. Returns the index into closed_rects, or -1 if the bbox
+    isn't inside any of them. Used to build the 'same_rect_member' edge
+    feature (see pymupdf_util_edge.get_edge_transform_yf): two nodes with
+    the same (non -1) rect member id sit inside the same closed
+    rectangle -- e.g. two cells of the same table -- while two nodes in
+    different (or no) closed rectangles don't, even if they happen to be
+    geometrically close (e.g. cells from two separate, adjacent tables).
+    """
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    for idx, (x0, y0, x1, y1) in enumerate(closed_rects):
+        if x0 <= cx <= x1 and y0 <= cy <= y1:
+            return idx
+    return -1
+
+
 def merge_boxes(boxes, iou_threshold=0.5):
     """Merge overlapping bounding boxes based on IoU threshold."""
     from .common_util import compute_iou
@@ -505,6 +595,20 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
         h_lines = merge_lines(h_lines, orientation='h', tolerance=3)
         v_lines = merge_lines(v_lines, orientation='v', tolerance=3)
 
+        # Cache the merged (pre-truncation) result so other consumers of the
+        # same page (e.g. pymupdf_util_yf.create_feature_map's
+        # vector_margin_* channels) can reuse it instead of re-parsing
+        # page.get_drawings() and re-rasterizing page.get_pixmap() (the
+        # latter purely to sample a background color) a second time.
+        data_dict['vector_lines'] = (h_lines, v_lines)
+
+        # Also cache closed (full-border) rectangles derived from these same
+        # lines, for the 'same_rect_member' edge feature (see
+        # pymupdf_util_edge.get_edge_transform_yf) -- cheap to compute here
+        # since h_lines/v_lines are already in hand, and avoids recomputing
+        # per edge_type='YF' call.
+        data_dict['closed_rects'] = find_closed_border_rects(h_lines, v_lines)
+
         h_lines = sorted(h_lines, key=lambda r: r.width * r.height, reverse=True)[:max_vec_line_num]
         for rect in h_lines:
             x1 = rect.x0
@@ -536,8 +640,11 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
                     box_type.append(BOX_VLINE)
 
     # Extract text
-    if 'text' in input_type:
-        blocks = page.get_text("dict", textpage=stext_page)["blocks"]
+    if 'text' in input_type or 'text_pm' in input_type:
+        if 'text_pm' in input_type:
+            blocks = page.get_text("dict")["blocks"]
+        else:
+            blocks = page.get_text("dict", textpage=stext_page)["blocks"]
         text_extract(data_dict, box_type, page_width, page_height, blocks)
 
     # Extract checkboxes

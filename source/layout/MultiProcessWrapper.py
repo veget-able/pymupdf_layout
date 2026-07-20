@@ -270,10 +270,10 @@ class MultiProcessWrapper:
         n_pages  = doc.page_count
         doc.close()
 
-        args                                 = [(pdf_path, i, join, skip_header_footer) for i in range(n_pages)]
         results: list[tuple[int, list, str]] = []
 
         if self._n_workers >= 2:
+            args = [(pdf_path, i, join, skip_header_footer) for i in range(n_pages)]
             pool = self._ensure_pool()
             for i, res in enumerate(
                 pool.imap_unordered(_worker_to_result, args), 1
@@ -282,12 +282,19 @@ class MultiProcessWrapper:
                 if progress_callback:
                     progress_callback(i, n_pages)
         else:
-            _worker_init(*self._worker_args)
-            for i, arg in enumerate(args, 1):
-                res = _worker_to_result(arg)
-                results.append(res)
+            # Use the already-initialised main-process model directly.
+            # Calling _worker_init here would create a redundant ONNX session
+            # on every PDF, causing RSS to grow unboundedly across documents.
+            import fitz as _fitz
+            doc = _fitz.open(pdf_path)
+            for page_no in range(n_pages):
+                page   = doc[page_no]
+                layout = self._model.predict(page)
+                md     = self._model.to_markdown(page, join=join, skip_header_footer=skip_header_footer)
+                results.append((page_no, layout, md))
                 if progress_callback:
-                    progress_callback(i, n_pages)
+                    progress_callback(page_no + 1, n_pages)
+            doc.close()
 
         results.sort(key=lambda x: x[0])
 
@@ -317,10 +324,10 @@ class MultiProcessWrapper:
         n_pages = doc.page_count
         doc.close()
 
-        args                         = [(pdf_path, i, join, skip_header_footer) for i in range(n_pages)]
         results: list[tuple[int, str]] = []
 
         if self._n_workers >= 2:
+            args = [(pdf_path, i, join, skip_header_footer) for i in range(n_pages)]
             pool = self._ensure_pool()
             for i, res in enumerate(
                 pool.imap_unordered(_worker_to_markdown, args), 1
@@ -329,12 +336,17 @@ class MultiProcessWrapper:
                 if progress_callback:
                     progress_callback(i, n_pages)
         else:
-            _worker_init(*self._worker_args)
-            for i, arg in enumerate(args, 1):
-                res = _worker_to_markdown(arg)
-                results.append(res)
+            # Use the already-initialised main-process model directly.
+            # Calling _worker_init here would create a redundant ONNX session
+            # on every PDF, causing RSS to grow unboundedly across documents.
+            doc = fitz.open(pdf_path)
+            for page_no in range(n_pages):
+                page = doc[page_no]
+                md   = self._model.to_markdown(page, join=join, skip_header_footer=skip_header_footer)
+                results.append((page_no, md))
                 if progress_callback:
-                    progress_callback(i, n_pages)
+                    progress_callback(page_no + 1, n_pages)
+            doc.close()
 
         results.sort(key=lambda x: x[0])
         pages_md = [md for _, md in results]
@@ -355,10 +367,10 @@ class MultiProcessWrapper:
         n_pages = doc.page_count
         doc.close()
 
-        args                           = [(pdf_path, i, join, skip_header_footer) for i in range(n_pages)]
         results: list[tuple[int, str]] = []
 
         if self._n_workers >= 2:
+            args = [(pdf_path, i, join, skip_header_footer) for i in range(n_pages)]
             pool = self._ensure_pool()
             for i, res in enumerate(
                 pool.imap_unordered(_worker_to_markdown_html_table, args), 1
@@ -367,12 +379,17 @@ class MultiProcessWrapper:
                 if progress_callback:
                     progress_callback(i, n_pages)
         else:
-            _worker_init(*self._worker_args)
-            for i, arg in enumerate(args, 1):
-                res = _worker_to_markdown_html_table(arg)
-                results.append(res)
+            # Use the already-initialised main-process model directly.
+            # Calling _worker_init here would create a redundant ONNX session
+            # on every PDF, causing RSS to grow unboundedly across documents.
+            doc = fitz.open(pdf_path)
+            for page_no in range(n_pages):
+                page = doc[page_no]
+                md   = self._model.to_markdown_html_table(page, join=join, skip_header_footer=skip_header_footer)
+                results.append((page_no, md))
                 if progress_callback:
-                    progress_callback(i, n_pages)
+                    progress_callback(page_no + 1, n_pages)
+            doc.close()
 
         results.sort(key=lambda x: x[0])
         pages_md = [md for _, md in results]

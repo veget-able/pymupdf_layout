@@ -48,10 +48,12 @@ class MarkdownGenerator:
     # Public interface
     # ------------------------------------------------------------------
 
-    def generate(self, page: Any, join: bool = True, skip_header_footer: bool = True):
+    def generate(self, page: Any, groups: list | None = None,
+                 join: bool = True, skip_header_footer: bool = True):
         from ..pymupdf_util import create_input_data_from_page
 
-        groups = self.model.predict(page, return_raw=True)
+        if groups is None:
+            groups = self.model.predict(page, return_raw=True)
         if not groups:
             return "" if join else []
 

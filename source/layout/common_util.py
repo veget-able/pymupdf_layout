@@ -6,6 +6,35 @@ from collections import Counter
 from typing import Optional, List, Dict, Tuple
 
 
+def softmax_numpy(x: np.ndarray, axis: int = 0) -> np.ndarray:
+    """
+    Numerically stable softmax along the given axis.
+
+    Args:
+        x: input array of any shape.
+        axis: axis along which softmax is computed.
+
+    Returns:
+        np.ndarray of the same shape as x, summing to 1.0 along axis.
+    """
+    x_shifted = x - np.max(x, axis=axis, keepdims=True)
+    exp_x = np.exp(x_shifted)
+    return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
+
+
+def sigmoid_numpy(x: np.ndarray) -> np.ndarray:
+    """
+    Numerically stable sigmoid.
+
+    Args:
+        x: input array of any shape.
+
+    Returns:
+        np.ndarray of the same shape as x, values in (0, 1).
+    """
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def get_boxes_transform(bboxes_list):
     """
     Normalizes bounding box coordinates (x1, y1, x2, y2) and
@@ -72,6 +101,38 @@ def get_boxes_transform(bboxes_list):
 
 def get_edge_by_directional_nn(bbox: np.ndarray, dist_threshold: int, vertical_gap: float = 0.3) -> tuple[
     list[tuple[int, int]], dict[str, list[tuple[int, int]]]]:
+    """
+    NOTE (direction-label fix): this function's internal direction names used
+    to be swapped -- what was called 'left_dis_matrix' actually finds each
+    box's nearest neighbor to its RIGHT, 'right_dis_matrix' actually finds
+    the neighbor to its LEFT, 'up_dis_matrix' actually finds the neighbor
+    BELOW, and 'down_dis_matrix' actually finds the neighbor ABOVE (verified
+    empirically: e.g. for 3 boxes in a row, the matrix named "left" matched
+    each box to the one on its right). All of the variable names and
+    direction_edges dict keys below have been corrected to match what is
+    actually computed. The underlying distance formulas and filter
+    conditions are UNCHANGED from before this fix, so the final `edge_index`
+    returned by this function (the only thing build_edge_index actually
+    uses -- it discards direction_edges) is bit-for-bit identical to before.
+    This matters for reproducibility with any model already trained on
+    graphs built by the previous version of this function.
+
+    Only the *direction_edges* dict (previously unused by any caller in this
+    codebase) is affected in practice: code that starts relying on
+    direction_edges['left'] meaning "genuinely left of this node" would have
+    silently gotten right-neighbors before this fix.
+
+    Open question, NOT resolved here (see down_neighbor_y_dis_matrix below):
+    the y-only-distance matrix historically named 'down_y' reused what was
+    then called 'up_dis_matrix's filter condition. Since that matrix's TRUE
+    behavior is "find the neighbor below", down_y ends up being a
+    y-distance-only variant that's largely redundant with the (corrected)
+    down_neighbor_dis_matrix, just with an added x-alignment constraint and
+    coarser (y-only, not x+y) ranking. Whether this was an intentional
+    distinct signal or a copy-paste of the wrong direction's filter is
+    unconfirmed -- flagged for future review rather than changed, since its
+    actual behavior (like everything else here) is left untouched by this fix.
+    """
     bbox_num = len(bbox)
     eye_matrix = np.eye(bbox_num, dtype=bool)  # eye_matrix를 명시적으로 bool 타입으로 생성
 
@@ -124,41 +185,44 @@ def get_edge_by_directional_nn(bbox: np.ndarray, dist_threshold: int, vertical_g
         filtered_matrix[filter_mask] = math.inf
         return filtered_matrix
 
-    # 각 방향별 거리 행렬 및 필터링
-    # 조건식도 원본 함수의 패턴에 맞춰서 생성하여 전달
-    left_dis_matrix = get_filtered_distance_matrix(
+    # 각 방향별 거리 행렬 및 필터링 (변수명은 실제로 계산되는 방향에 맞게 수정됨;
+    # 수식/필터 자체는 수정 전과 완전히 동일 -- 위 NOTE 참고)
+    right_neighbor_dis_matrix = get_filtered_distance_matrix(
         hor_x_dis_matrix + hor_y_dis_matrix,
         y_center_flag,
         eye_matrix,
         bbox[:, 2].repeat(bbox_num).reshape((bbox_num, -1)).T <= bbox[:, 2].repeat(bbox_num).reshape((bbox_num, -1))
     )
 
-    right_dis_matrix = get_filtered_distance_matrix(
+    left_neighbor_dis_matrix = get_filtered_distance_matrix(
         hor_x_dis_matrix + hor_y_dis_matrix,
         y_center_flag,
         eye_matrix,
         bbox[:, 0].repeat(bbox_num).reshape((bbox_num, -1)).T >= bbox[:, 0].repeat(bbox_num).reshape((bbox_num, -1))
     )
 
-    up_dis_matrix = get_filtered_distance_matrix(
+    down_neighbor_dis_matrix = get_filtered_distance_matrix(
         ver_x_dis_matrix + ver_y_dis_matrix,
         eye_matrix,
         bbox[:, 3].repeat(bbox_num).reshape((bbox_num, -1)).T <= bbox[:, 3].repeat(bbox_num).reshape((bbox_num, -1))
     )
 
-    down_dis_matrix = get_filtered_distance_matrix(
+    up_neighbor_dis_matrix = get_filtered_distance_matrix(
         ver_x_dis_matrix + ver_y_dis_matrix,
         eye_matrix,
         bbox[:, 1].repeat(bbox_num).reshape((bbox_num, -1)).T >= bbox[:, 1].repeat(bbox_num).reshape((bbox_num, -1))
     )
-    down_y_dis_matrix = np.copy(ver_y_dis_matrix)
-    up_dis_flag_for_y_original_logic = np.logical_or(
+
+    # y-only-distance variant -- reuses down_neighbor_dis_matrix's filter
+    # condition (see open question in the function docstring above).
+    down_neighbor_y_dis_matrix = np.copy(ver_y_dis_matrix)
+    _down_neighbor_y_filter_condition = np.logical_or(
         eye_matrix,
         bbox[:, 3].repeat(bbox_num).reshape((bbox_num, -1)).T <= bbox[:, 3].repeat(bbox_num).reshape((bbox_num, -1))
     )
 
-    down_y_filter_mask = np.logical_or(up_dis_flag_for_y_original_logic, x_center_flag)
-    down_y_dis_matrix[down_y_filter_mask] = math.inf
+    down_neighbor_y_filter_mask = np.logical_or(_down_neighbor_y_filter_condition, x_center_flag)
+    down_neighbor_y_dis_matrix[down_neighbor_y_filter_mask] = math.inf
 
     # 각 방향에서 가장 가까운 이웃 찾기
     def get_nearest_indices(distance_matrix, matrix_name="Unnamed"):
@@ -172,37 +236,37 @@ def get_edge_by_directional_nn(bbox: np.ndarray, dist_threshold: int, vertical_g
     # 각 방향별 원본 엣지들을 저장할 딕셔너리
     direction_edges = {}
 
-    left_edges = get_nearest_indices(left_dis_matrix, "left_dis_matrix")
+    left_edges = get_nearest_indices(left_neighbor_dis_matrix, "left_neighbor_dis_matrix")
     direction_edges['left'] = left_edges
 
-    right_edges = get_nearest_indices(right_dis_matrix, "right_dis_matrix")
+    right_edges = get_nearest_indices(right_neighbor_dis_matrix, "right_neighbor_dis_matrix")
     direction_edges['right'] = right_edges
 
-    up_edges = get_nearest_indices(up_dis_matrix, "up_dis_matrix")
+    up_edges = get_nearest_indices(up_neighbor_dis_matrix, "up_neighbor_dis_matrix")
     direction_edges['up'] = up_edges
 
-    down_edges = get_nearest_indices(down_dis_matrix, "down_dis_matrix")
+    down_edges = get_nearest_indices(down_neighbor_dis_matrix, "down_neighbor_dis_matrix")
     direction_edges['down'] = down_edges
 
-    down_y_edges = get_nearest_indices(down_y_dis_matrix, "down_y_dis_matrix")
+    down_y_edges = get_nearest_indices(down_neighbor_y_dis_matrix, "down_neighbor_y_dis_matrix")
     direction_edges['down_y'] = down_y_edges
 
     # 수직 방향으로 두 번째 가까운 이웃 찾기
-    up_dis_matrix_copy = np.copy(up_dis_matrix)
-    down_dis_matrix_copy = np.copy(down_dis_matrix)
+    down_neighbor_dis_matrix_copy = np.copy(down_neighbor_dis_matrix)
+    up_neighbor_dis_matrix_copy = np.copy(up_neighbor_dis_matrix)
 
     # 첫 번째 이웃을 무한대로 설정하여 두 번째 이웃 찾기
     for i in range(bbox_num):
-        if np.min(up_dis_matrix_copy[i]) != math.inf:
-            up_dis_matrix_copy[i, np.argmin(up_dis_matrix_copy[i])] = math.inf
-        if np.min(down_dis_matrix_copy[i]) != math.inf:
-            down_dis_matrix_copy[i, np.argmin(down_dis_matrix_copy[i])] = math.inf
+        if np.min(down_neighbor_dis_matrix_copy[i]) != math.inf:
+            down_neighbor_dis_matrix_copy[i, np.argmin(down_neighbor_dis_matrix_copy[i])] = math.inf
+        if np.min(up_neighbor_dis_matrix_copy[i]) != math.inf:
+            up_neighbor_dis_matrix_copy[i, np.argmin(up_neighbor_dis_matrix_copy[i])] = math.inf
 
-    second_up_edges = get_nearest_indices(up_dis_matrix_copy, "second_up_dis_matrix")
-    direction_edges['second_up'] = second_up_edges
-
-    second_down_edges = get_nearest_indices(down_dis_matrix_copy, "second_down_dis_matrix")
+    second_down_edges = get_nearest_indices(down_neighbor_dis_matrix_copy, "second_down_neighbor_dis_matrix")
     direction_edges['second_down'] = second_down_edges
+
+    second_up_edges = get_nearest_indices(up_neighbor_dis_matrix_copy, "second_up_neighbor_dis_matrix")
+    direction_edges['second_up'] = second_up_edges
 
     # 모든 원본 엣지들을 하나의 리스트로 합치기 (중복 제거 및 정규화 전)
     all_raw_edges = []
@@ -224,47 +288,49 @@ def get_edge_by_directional_nn(bbox: np.ndarray, dist_threshold: int, vertical_g
 
 
 def get_edge_by_alignment(bbox: np.ndarray, dist_threshold: float = 0.001, center_limit: float = 10000) -> list[tuple[int, int]]:
-    bbox_num = len(bbox)
-    edges = []
+    """
+    Vectorized (broadcasting-based, matching get_edge_by_directional_nn's
+    style). Previously a pure-Python O(N^2) double loop with a per-pair
+    `any(...)` generator call -- the only unvectorized edge-construction
+    function in this module. Not currently used by build_edge_index's
+    default '4D' path (only by the experimental '4D+AL' path, not currently
+    active), but fixed for consistency and to remove the latent bottleneck.
 
-    # Calculate box coordinates
+    Returns the exact same edge set, in the exact same order, as the
+    previous implementation (both iterate implicitly in row-major (i, j)
+    order over i < j pairs).
+    """
+    bbox_num = len(bbox)
+    if bbox_num < 2:
+        return []
+
     lefts = bbox[:, 0]
     tops = bbox[:, 1]
     rights = bbox[:, 2]
     bottoms = bbox[:, 3]
 
-    # Calculate center coordinates
     centers_x = (lefts + rights) / 2
     centers_y = (tops + bottoms) / 2
 
-    # Define alignment reference coordinates
-    horizontal_keys = [lefts, rights, centers_x]
-    vertical_keys = [tops, bottoms, centers_y]
+    # Pairwise center distance
+    center_dist = np.sqrt(
+        (centers_x[:, None] - centers_x[None, :]) ** 2
+        + (centers_y[:, None] - centers_y[None, :]) ** 2
+    )
 
-    for i in range(bbox_num):
-        for j in range(i + 1, bbox_num):
-            # Skip if center distance exceeds limit
-            center_dist = np.sqrt((centers_x[i] - centers_x[j]) ** 2 + (centers_y[i] - centers_y[j]) ** 2)
-            if center_dist > center_limit:
-                continue
+    hor_aligned = np.zeros((bbox_num, bbox_num), dtype=bool)
+    for h in (lefts, rights, centers_x):
+        hor_aligned |= np.abs(h[:, None] - h[None, :]) <= dist_threshold
 
-            # Check horizontal alignment using absolute threshold
-            hor_aligned = any(
-                abs(h[i] - h[j]) <= dist_threshold
-                for h in horizontal_keys
-            )
+    ver_aligned = np.zeros((bbox_num, bbox_num), dtype=bool)
+    for v in (tops, bottoms, centers_y):
+        ver_aligned |= np.abs(v[:, None] - v[None, :]) <= dist_threshold
 
-            # Check vertical alignment using absolute threshold
-            ver_aligned = any(
-                abs(v[i] - v[j]) <= dist_threshold
-                for v in vertical_keys
-            )
+    valid = (center_dist <= center_limit) & (hor_aligned | ver_aligned)
+    valid = np.triu(valid, k=1)  # i < j only, matching the original loop's range(i+1, bbox_num)
 
-            # Add edge if either alignment condition is met
-            if hor_aligned or ver_aligned:
-                edges.append((i, j))
-
-    return edges
+    i_idx, j_idx = np.nonzero(valid)
+    return list(zip(i_idx.tolist(), j_idx.tolist()))
 
 
 def get_edge_by_knn(bboxes: np.ndarray, k: int) -> np.ndarray:
@@ -392,9 +458,19 @@ def get_edge_transform_bbox_add_alignment(bboxes: np.ndarray, edge_index: list):
     Args:
         bboxes (np.ndarray): (N, 4) NumPy array in [x_min, y_min, x_max, y_max] format.
         edge_index (list): (E, 2) list of tuples, where each tuple (src_idx, dst_idx)
+
+    Returns:
+        np.ndarray: (E, 24) array of edge features (18 relation + 6 alignment).
     """
     if len(edge_index) == 0:
-        return np.empty((0, 18), dtype=np.float32)
+        # 24, not 18: this function returns 18 relation features + 6
+        # alignment features (unlike get_edge_transform_bbox, which only has
+        # the 18). The empty-case guard previously returned (0, 18), copied
+        # from that other function without updating the column count for
+        # this one's actual 24-column output -- a real shape mismatch bug
+        # whenever edge_index happened to be empty (e.g. a page with a
+        # single isolated element and no other nodes to connect to).
+        return np.empty((0, 24), dtype=np.float32)
 
     # Convert edge_index list of tuples to numpy array
     # edge_index_np will be (E, 2)
@@ -1090,7 +1166,7 @@ def _binary_opening_numpy(binary_image, kernel_size):
     return cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
 
 def extract_bboxes_from_segmentation(
-    ort_outputs: np.ndarray,
+    seg_logits: np.ndarray,
     class_names: list[str],
     target_class: list[str] | None = None,
     min_component_area: int = 10,
@@ -1100,14 +1176,18 @@ def extract_bboxes_from_segmentation(
     Extract bounding boxes only for the classes you care about.
 
     Args:
-        ort_outputs (np.ndarray):
-            Raw network output of shape (1, C_all, H, W).  The last len(class_names)
-            channels are assumed to be per-class softmax probabilities.
+        seg_logits (np.ndarray):
+            Per-class segmentation logits, shape (1, len(class_names), H, W).
+            The caller must slice out exactly the class channels before
+            calling this function; no implicit channel slicing happens here.
+            Detection uses argmax, which is invariant to whether the values
+            are raw logits or post-softmax probabilities, so either can be
+            passed in.
         class_names (list[str]):
-            Ordered list of class names (index i ¡ê channel i).
+            Ordered list of class names (index i corresponds to channel i).
         target_class (list[str] | None):
-            If given, only these classes are processed.  None ¡æ process every
-            class except background (class-id 0).
+            If given, only these classes are processed.  None means process
+            every class except background (class-id 0).
         min_component_area (int):
             Connected components smaller than this many pixels are ignored.
         morphology_kernel_size (int):
@@ -1121,7 +1201,12 @@ def extract_bboxes_from_segmentation(
             score = (# pixels of predicted class inside bbox) / (bbox area).
     """
     n_classes = len(class_names)
-    seg_maps = ort_outputs[0, -n_classes:, :, :]          # (n_classes, H, W)
+    assert seg_logits.shape[1] == n_classes, (
+        f"seg_logits channel count ({seg_logits.shape[1]}) must equal "
+        f"len(class_names) ({n_classes}); caller must pass only the "
+        f"class-logit channels, not a larger feature tensor."
+    )
+    seg_maps = seg_logits[0]          # (n_classes, H, W)
 
     # build quick lookup & filter requested classes
     if target_class is None:
@@ -1255,7 +1340,7 @@ def _find_connected_components_numpy(binary_mask: np.ndarray, min_area: int) -> 
 
 
 def extract_bboxes_from_segmentation_numpy(
-        ort_outputs: np.ndarray,
+        seg_logits: np.ndarray,
         class_names: list[str],
         target_class: list[str] | None = None,
         min_component_area: int = 10,
@@ -1271,10 +1356,13 @@ def extract_bboxes_from_segmentation_numpy(
     needed.
 
     Args:
-        ort_outputs (np.ndarray):
-            Raw network output of shape (1, C_all, H, W).  The last
-            len(class_names) channels are treated as per-class logits /
-            probabilities.
+        seg_logits (np.ndarray):
+            Per-class segmentation logits, shape (1, len(class_names), H, W).
+            The caller must slice out exactly the class channels before
+            calling this function; no implicit channel slicing happens here.
+            Detection uses argmax, which is invariant to whether the values
+            are raw logits or post-softmax probabilities, so either can be
+            passed in.
         class_names (list[str]):
             Ordered list of class names (index i corresponds to channel i).
         target_class (list[str] | None):
@@ -1296,7 +1384,12 @@ def extract_bboxes_from_segmentation_numpy(
             class in the *original* class map.
     """
     n_classes = len(class_names)
-    seg_maps = ort_outputs[0, -n_classes:, :, :]  # (n_classes, H, W)
+    assert seg_logits.shape[1] == n_classes, (
+        f"seg_logits channel count ({seg_logits.shape[1]}) must equal "
+        f"len(class_names) ({n_classes}); caller must pass only the "
+        f"class-logit channels, not a larger feature tensor."
+    )
+    seg_maps = seg_logits[0]  # (n_classes, H, W)
     orig_h, orig_w = seg_maps.shape[1], seg_maps.shape[2]
 
     # Argmax on full-resolution map (cheap; single vectorized op)

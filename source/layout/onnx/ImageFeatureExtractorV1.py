@@ -3,9 +3,9 @@ ImageFeatureExtractorV1
 Purpose: ONNX-based image feature extraction and segmentation-based bbox detection.
 
 CCL execution strategy (lazy):
-    predict()               ? ONNX inference only. CCL is NOT run.
-    is_image_page(page_img) ? runs predict() + non-picture CCL only.
-    get_picture_detections()? runs picture CCL on first call after predict().
+    predict()               -> ONNX inference only. CCL is NOT run.
+    is_image_page(page_img) -> runs predict() + non-picture CCL only.
+    get_picture_detections()-> runs picture CCL on first call after predict().
 
 This minimises redundant work across three usage patterns:
 
@@ -19,14 +19,39 @@ This minimises redundant work across three usage patterns:
              ONNX: 1,  CCL: 0
 
 Cache protocol (single-use):
-    mark_cached() / consume_cache() ? let BoxRFDGNN.is_image_page() signal
+    mark_cached() / consume_cache() -> let BoxRFDGNN.is_image_page() signal
     that ONNX inference has already run, so the next
     image_feature_extraction_task() call skips predict().
+
+ONNX output contract (matches ImageFeatureExtractorV2):
+    'combined' -- (1, 5*F, H, W) concatenated decoder feature maps
+    'logits'   -- (1, C,   H, W) raw per-class segmentation logits (no
+                  softmax baked into the graph; CCL uses argmax, which does
+                  not need it, and softmax is computed in numpy elsewhere
+                  only where an actual probability is required).
+Both outputs are read by name via out_map, never by output position, so the
+extraction code here is robust to output ordering the same way V2 is.
+
+get_feature_map() / get_class_logits() contract:
+    These two outputs are kept SEPARATE (not concatenated) because they have
+    different statistical character: 'combined' is a continuous embedding
+    space best summarized by mean/max pooling, while 'logits' is a per-class
+    score that should be turned into a probability (softmax) before pooling
+    with ops like mean/min/max/entropy/margin. Callers that need both
+    (e.g. GNN node/edge image features) pool each separately with
+    roi_pooling.extract_bbox_features_by_roi_pooling and concatenate the
+    results themselves; see roi_pooling.DEFAULT_FEATURE_MAP_POOLING_OPS and
+    DEFAULT_CLASS_LOGITS_POOLING_OPS.
 """
 
 import numpy as np
 
-from ..common_util import resize_image, to_gray, extract_bboxes_from_segmentation, extract_bboxes_from_segmentation_numpy
+from ..common_util import (
+    resize_image,
+    to_gray,
+    extract_bboxes_from_segmentation,
+    extract_bboxes_from_segmentation_numpy,
+)
 
 
 # Class names expected from the segmentation head (index-aligned with channel axis)
@@ -63,10 +88,11 @@ class ImageFeatureExtractorV1:
             onnx_session: onnxruntime.InferenceSession (or any object with
                           get_inputs() / run() matching the ORT interface)
         """
-        self._session     = onnx_session
-        self._feature_map = None   # (1, C, H, W) float32 ? raw ONNX output
-        self._raw_outputs = None   # same as _feature_map; kept as alias for CCL input
-        self._cached      = False  # cache flag for image_feature_extraction_task()
+        self._session      = onnx_session
+        self._combined     = None  # (1, 5*F, H, W) float32 -- decoder feature map, GNN input
+        self._logits       = None  # (1, C,   H, W) float32 -- per-class seg logits, GNN input
+        self._raw_outputs  = None  # alias for _logits; kept for CCL callers
+        self._cached       = False  # cache flag for image_feature_extraction_task()
 
         # Lazy CCL results ? None means "not yet computed for this predict() cycle"
         self._detections_picture     = None  # list[dict] | None
@@ -102,8 +128,8 @@ class ImageFeatureExtractorV1:
 
     def predict(self, page_img, aug_fetmap=None):
         """
-        Run ONNX inference and store the raw output.
-        CCL is NOT performed here ? results are computed lazily on demand.
+        Run ONNX inference and store the outputs.
+        CCL is NOT performed here -- results are computed lazily on demand.
 
         Calling predict() invalidates all previously cached CCL results so
         that get_picture_detections() and is_image_page() always reflect the
@@ -114,9 +140,10 @@ class ImageFeatureExtractorV1:
             aug_fetmap: optional extra channel map concatenated before inference
 
         Side effects:
-            self._feature_map / self._raw_outputs <- (1, C, H, W)
-            self._detections_picture     <- reset to None
-            self._detections_non_picture <- reset to None
+            self._combined / self._logits    <- set from ONNX outputs by name
+            self._raw_outputs                <- alias for self._logits (CCL input)
+            self._detections_picture         <- reset to None
+            self._detections_non_picture     <- reset to None
         """
         self._page_h, self._page_w = page_img.shape[:2]
 
@@ -138,12 +165,17 @@ class ImageFeatureExtractorV1:
             nn_input = np.concatenate([nn_input, aug_fetmap], axis=0)
         nn_input = np.expand_dims(nn_input, axis=0)    # (1, C_in, H, W)
 
-        # ONNX inference
+        # ONNX inference -- read outputs by name (out_map), never by
+        # position, so this stays correct regardless of output ordering or
+        # future additional outputs (same pattern as ImageFeatureExtractorV2).
         input_name   = self._session.get_inputs()[0].name
-        ort_outputs  = self._session.run(None, {input_name: nn_input})[0]
+        output_names = [o.name for o in self._session.get_outputs()]
+        ort_outputs  = self._session.run(output_names, {input_name: nn_input})
+        out_map      = dict(zip(output_names, ort_outputs))
 
-        self._feature_map = ort_outputs
-        self._raw_outputs = ort_outputs
+        self._combined = out_map['combined']
+        self._logits   = out_map['logits']
+        self._raw_outputs = self._logits
 
         # Invalidate stale CCL results from the previous predict() cycle
         self._detections_picture     = None
@@ -158,7 +190,7 @@ class ImageFeatureExtractorV1:
         if self._detections_picture is not None:
             return
         self._detections_picture = extract_bboxes_from_segmentation_numpy(
-            self._raw_outputs,
+            seg_logits=self._logits,
             class_names=_CLASS_NAMES,
             target_class=[_PICTURE_CLASS],
             min_component_area=_MIN_COMPONENT_AREA,
@@ -169,7 +201,7 @@ class ImageFeatureExtractorV1:
         if self._detections_non_picture is not None:
             return
         self._detections_non_picture = extract_bboxes_from_segmentation_numpy(
-            self._raw_outputs,
+            seg_logits=self._logits,
             class_names=_CLASS_NAMES,
             target_class=_NON_PICTURE_CLASSES,
             min_component_area=_MIN_COMPONENT_AREA,
@@ -181,12 +213,28 @@ class ImageFeatureExtractorV1:
 
     def get_feature_map(self):
         """
-        Return the raw feature map from the last predict() call.
+        Return the decoder feature map ('combined') from the last predict()
+        call. This is the continuous embedding output only -- it no longer
+        includes the class logits (see get_class_logits() for those).
 
         Returns:
-            np.ndarray of shape (1, C, H, W), or None if predict() not yet called.
+            np.ndarray of shape (1, 5*F, H, W), or None if predict() not
+            yet called.
         """
-        return self._feature_map
+        return self._combined
+
+    def get_class_logits(self):
+        """
+        Return the per-class segmentation logits ('logits') from the last
+        predict() call. Raw (pre-softmax) scores; apply softmax before
+        pooling ops that expect a probability distribution (e.g. entropy,
+        margin -- see roi_pooling.extract_bbox_features_by_roi_pooling).
+
+        Returns:
+            np.ndarray of shape (1, C, H, W), or None if predict() not yet
+            called.
+        """
+        return self._logits
 
     def is_image_page(self, page):
         """
@@ -221,7 +269,6 @@ class ImageFeatureExtractorV1:
             return False
 
         # Run ONNX inference on the page pixmap and cache the result
-        import numpy as np
         pix        = page.get_pixmap()
         bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
         page_img   = bytes_data.reshape(pix.height, pix.width, pix.n)
@@ -251,7 +298,7 @@ class ImageFeatureExtractorV1:
         Raises:
             RuntimeError if predict() has not been called.
         """
-        if self._raw_outputs is None:
+        if self._combined is None:
             raise RuntimeError("predict() must be called before get_picture_detections()")
 
         self._ensure_picture_detections()

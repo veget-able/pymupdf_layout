@@ -10,9 +10,12 @@ from ..common_util import (get_boxes_transform, get_edge_by_knn,
                            get_edge_transform_bbox,
                            get_text_pattern, get_edge_matrix, group_node_by_edge,
                            resize_image, compute_iou)
-from ..roi_pooling import extract_bbox_features_by_roi_pooling
+from ..roi_pooling import (extract_bbox_features_by_roi_pooling,
+                           RoiPoolingSession,
+                           DEFAULT_FEATURE_MAP_POOLING_OPS,
+                           DEFAULT_CLASS_LOGITS_POOLING_OPS)
 from ..pymupdf_util import create_input_data_from_page
-from ..pymupdf_util_edge import get_edge_attr, get_edge_dim, build_edge_index, append_image_edge_features
+from ..pymupdf_util_edge import get_edge_attr, get_edge_dim, build_edge_index, compute_edge_gap_bboxes
 from .ImageFeatureExtractorV1 import ImageFeatureExtractorV1
 from .ImageFeatureExtractorV2 import ImageFeatureExtractorV2
 from .TableGridExtractor import TableGridExtractor
@@ -171,18 +174,52 @@ def get_nn_input_from_datadict(data_dict, cfg, return_nn_index=False,
         crop_img = resize_image(crop_img, (500, 500))
 
     feature_map = data_dict.get('feature_map')
+    class_logits = data_dict.get('class_logits')
 
-    # Image feature extractor
-    if feature_map is not None:
+    # Image feature extractor.
+    # feature_map (decoder embedding) and class_logits (per-class scores) are
+    # pooled SEPARATELY -- they have different statistical character -- and
+    # then concatenated. class_logits is always softmaxed before pooling
+    # since its entropy/margin ops are only meaningful over a probability
+    # distribution.
+    #
+    # When use_image_edge is True, the SAME feature_map/class_logits tensors
+    # are pooled twice per page: once for node bboxes, once for edge-union
+    # bboxes. A RoiPoolingSession is used in that case so the bbox-
+    # independent softmax/SAT setup (see roi_pooling.RoiPoolingSession) is
+    # built once and shared between the node and edge queries, rather than
+    # each query rebuilding it independently. When there's only one query
+    # (use_image_edge=False), the plain one-shot function is used instead --
+    # it already dispatches naive-vs-SAT per call, which is the better
+    # choice when there's nothing to amortize the SAT build cost over.
+    if feature_map is not None and class_logits is not None:
         page_h, page_w, _ = page_img.shape
 
-        image_features = extract_bbox_features_by_roi_pooling(feature_map, original_bboxes, page_w, page_h,
-                                                              apply_softmax=False, concat_mean_max=True,
-                                                              add_uncertainty=False)
-
         if use_image_edge:
-            edge_attr = append_image_edge_features(edge_attr, edge_index, original_bboxes,
-                                                   feature_map, page_w, page_h)
+            feat_session = RoiPoolingSession(feature_map, pooling_ops=DEFAULT_FEATURE_MAP_POOLING_OPS)
+            logit_session = RoiPoolingSession(class_logits, pooling_ops=DEFAULT_CLASS_LOGITS_POOLING_OPS,
+                                              apply_softmax=True)
+
+            feat_pooled = feat_session.query(original_bboxes, page_w, page_h)
+            logit_pooled = logit_session.query(original_bboxes, page_w, page_h)
+            image_features = np.concatenate([feat_pooled, logit_pooled], axis=1)
+
+            edge_bboxes = compute_edge_gap_bboxes(edge_index, original_bboxes)
+            edge_feat_pooled = feat_session.query(edge_bboxes, page_w, page_h)
+            edge_logit_pooled = logit_session.query(edge_bboxes, page_w, page_h)
+            edge_image_features = np.concatenate([edge_feat_pooled, edge_logit_pooled], axis=1)
+            edge_attr = np.concatenate([edge_attr, edge_image_features], axis=1)
+        else:
+            feat_pooled = extract_bbox_features_by_roi_pooling(
+                feature_map, original_bboxes, page_w, page_h,
+                pooling_ops=DEFAULT_FEATURE_MAP_POOLING_OPS,
+            )
+            logit_pooled = extract_bbox_features_by_roi_pooling(
+                class_logits, original_bboxes, page_w, page_h,
+                pooling_ops=DEFAULT_CLASS_LOGITS_POOLING_OPS,
+                apply_softmax=True,
+            )
+            image_features = np.concatenate([feat_pooled, logit_pooled], axis=1)
     else:
         image_features = None
 
@@ -269,22 +306,22 @@ class BoxRFDGNN:
         # Note: If has_conn is True, it uses table_conn_model_path.
         #       If has_conn is None, conn_onnx_path is set to None explicitly.
         GRID_MODEL_CONFIGS = {
-            'V1': (TableGridExtractor, 'table_grid_model_v1.onnx', False, 0.3, 0.25, None),
-            'V1A': (TableGridExtractorV1A, 'table_grid_model_v1a.onnx', False, 0.15, 0.5, None),
-            'V1B': (TableGridExtractorV1B, 'table_grid_model_v1a.onnx', False, 0.15, 0.4, None),
-            'V1T': (TableGridExtractor, 'table_grid_model_v1t.onnx', False, 0.5, 0.05, None),
-            'V1T-A': (TableGridExtractorV1A, 'table_grid_model_v1t.onnx', False, 0.15, 0.05, None),
-            'V1T-B': (TableGridExtractorV1B, 'table_grid_model_v1t.onnx', False, 0.25, 0.15, None),
+            'V1': (TableGridExtractor, 'table_grid_model_v1.onnx', False, 0.3, 0.35, None),
+            'V1A': (TableGridExtractorV1A, 'table_grid_model_v1a.onnx', False, 0.15, 0.2, None),
+            'V1B': (TableGridExtractorV1B, 'table_grid_model_v1a.onnx', False, 0.15, 0.2, None),
+            'V1T': (TableGridExtractor, 'table_grid_model_v1t.onnx', False, 0.5, 0.15, None),
+            'V1T-A': (TableGridExtractorV1A, 'table_grid_model_v1t.onnx', False, 0.0, 0.0, None),
+            'V1T-B': (TableGridExtractorV1B, 'table_grid_model_v1t.onnx', False, 0.25, 0.05, None),
 
-            'V2': (TableGridExtractorV2, 'table_grid_model_v2_grid.onnx', None, 0.3, 0.25, None),
+            'V2': (TableGridExtractorV2, 'table_grid_model_v2_grid.onnx', None, 0.3, 0.2, None),
             'V2A': (TableGridExtractorV2A, 'table_grid_model_v2_grid.onnx', None, 0.2, 0.1, None),
             'V2B': (TableGridExtractorV2B, 'table_grid_model_v2_grid.onnx', None, 0.2, 0.1, None),
-            'V2C': (TableGridExtractorV2, 'table_grid_model_v2c.onnx', None, 0.15, 0.05, None),
+            'V2C': (TableGridExtractorV2, 'table_grid_model_v2c.onnx', None, 0.2, 0.05, None),
 
-            'V3': (TableGridExtractorV3, 'table_grid_model_v3.onnx', False, 0.3, 0.4, None),
+            'V3': (TableGridExtractorV3, 'table_grid_model_v3.onnx', False, 0.35, 0.2, None),
 
             'V4-DO': (TableGridExtractorV2, 'table_grid_model_v4_do.onnx', None, 0.1, 0.3, 0.01),
-            'V4-EP': (TableGridExtractorV2, 'table_grid_model_v4_ep.onnx', None, 0.15, 0.35, 0.01),
+            'V4-EP': (TableGridExtractorV2, 'table_grid_model_v4_ep.onnx', None, 0.2, 0.25, 0.01),
         }
 
         # Normalize alias for V4
@@ -993,18 +1030,23 @@ class BoxRFDGNN:
             det_result.append(g_bbox)
 
         # Post-processing: add image regions and refine bboxes with vector graphics
-        img_bboxes = [itm["bbox"] for itm in page.get_image_info()]
+        filter_img_bboxes = kwargs.get('filter_img_bboxes', False)
+        expand_by_vectors = kwargs.get('expand_by_vectors', False)
+        do_sort = kwargs.get('do_sort', True)
 
         if self.input_type is not None and 'post-seg-image' in self.input_type:
             det_result, groups = self._apply_post_seg_image(det_result, groups)
         else:
-            det_result, groups = self._filter_img_bboxes(det_result, groups, img_bboxes)
-            det_result, groups = self._expand_by_vectors(det_result, groups, page)
+            if filter_img_bboxes:
+                img_bboxes = [itm["bbox"] for itm in page.get_image_info()]
+                det_result, groups = self._filter_img_bboxes(det_result, groups, img_bboxes)
+            if expand_by_vectors:
+                det_result, groups = self._expand_by_vectors(det_result, groups, page)
 
         # Always applied: merge overlapping picture detections.
         det_result, groups = self._merge_overlapping_pictures(det_result, groups)
 
-        if self.use_sort:
+        if self.use_sort and do_sort:
             order      = self.sorter.sort(page, groups, det_result)
             groups     = [groups[i]     for i in order]
             det_result = [det_result[i] for i in order]
@@ -1017,7 +1059,13 @@ class BoxRFDGNN:
         if groups is not None: # Ensure groups object exists
             for group in groups:
                 cls_name = group['class_name'] # Class name should already be set
-                
+
+                # Attach the raw pymupdf-extracted bboxes (before layout grouping)
+                # that were merged into this group, for detailed inspection via
+                # return_raw. Note this only covers bboxes that ended up in some
+                # group, not raw bboxes that were dropped as noise.
+                group['bboxes'] = [list(data_dict['bboxes'][i]) for i in group['indicies']]
+
                 # Check if table grid needs to be processed (e.g., if not already in cache or if it's a table)
                 if self.table_grid_extractor is not None and cls_name == 'table':
                     # Add this check to prevent redundant calculation for cached groups
@@ -1075,20 +1123,19 @@ class BoxRFDGNN:
                         group['table_grid'] = grid
                         group['table_cells'] = cells
 
-
         return_raw = kwargs.get('return_raw', False)
         if return_raw:
             return groups
 
         return det_result
 
-    def to_markdown(self, page, join: bool = True, skip_header_footer: bool = True) -> str:
+    def to_markdown(self, page, groups=None, join: bool = True, skip_header_footer: bool = True) -> str:
         """Convert page layout detection result to Markdown text."""
-        return self.markdown_generator.generate(page, join=join, skip_header_footer=skip_header_footer)
+        return self.markdown_generator.generate(page, groups=groups, join=join, skip_header_footer=skip_header_footer)
 
-    def to_markdown_html_table(self, page, join: bool = True, skip_header_footer: bool = True) -> str:
+    def to_markdown_html_table(self, page, groups=None, join: bool = True, skip_header_footer: bool = True) -> str:
         """Convert page layout detection result to Markdown with HTML tables."""
-        return self.markdown_html_table_generator.generate(page, join=join, skip_header_footer=skip_header_footer)
+        return self.markdown_html_table_generator.generate(page, groups=groups, join=join, skip_header_footer=skip_header_footer)
 
     def to_html(self, page, skip_header_footer: bool = True) -> str:
         """Convert page layout detection result to a complete HTML document."""

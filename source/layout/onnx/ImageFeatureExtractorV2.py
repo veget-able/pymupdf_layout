@@ -6,7 +6,12 @@ Purpose: ONNX-based image feature extraction and FCOS-based bbox detection
 Differences from V1 (UNetThin + CCL)
 --------------------------------------
 Feature map :  unchanged -- 'combined' decoder output (1, 5*F, H, W) is
-               forwarded to the GNN pipeline exactly as before.
+               forwarded to the GNN pipeline exactly as before, via
+               get_feature_map(). Class logits (1, C, H, W) are exposed
+               separately via get_class_logits() -- the two are no longer
+               concatenated (see get_feature_map()/get_class_logits()
+               docstrings for why: they have different statistical
+               character and should be pooled differently downstream).
 
 Detection   :  CCL replaced by FCOS heads.
                - coarse head (H/8) : table, picture
@@ -42,8 +47,24 @@ ONNX output layout varies by training flags (dec_all branch):
 import numpy as np
 
 try:
-    from ..common_util import resize_image, to_gray
+    from ..common_util import resize_image, to_gray, softmax_numpy, sigmoid_numpy
 except ImportError:
+    def softmax_numpy(x: np.ndarray, axis: int = 0) -> np.ndarray:
+        """
+        Numerically stable softmax along the given axis.
+        """
+        x_shifted = x - np.max(x, axis=axis, keepdims=True)
+        exp_x = np.exp(x_shifted)
+        return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
+
+
+    def sigmoid_numpy(x: np.ndarray) -> np.ndarray:
+        """
+        Numerically stable sigmoid.
+        """
+        return 1.0 / (1.0 + np.exp(-x))
+
+
     def resize_image(image: np.ndarray, new_size: tuple) -> np.ndarray:
         """
         Resize an image using bilinear interpolation with numpy (vectorized).
@@ -189,10 +210,6 @@ _NMS_IOU          = 0.25
 # Pure-numpy FCOS decoder (no PyTorch dependency at inference time)
 # ---------------------------------------------------------------------------
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
 def _nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> np.ndarray:
     """Greedy NMS on (N, 4) boxes sorted by descending score.
 
@@ -261,13 +278,11 @@ def _fcos_decode_numpy(
     """
     _, C, H, W = seg_logits.shape
 
-    # Softmax over class axis
-    seg_logits_b = seg_logits[0]                          # (C, H, W)
-    seg_logits_b = seg_logits_b - seg_logits_b.max(axis=0, keepdims=True)
-    exp           = np.exp(seg_logits_b)
-    seg_probs     = exp / exp.sum(axis=0, keepdims=True)  # (C, H, W)
+    # Softmax over class axis (numpy-side, not baked into the ONNX graph;
+    # see common_util.softmax_numpy for the shared implementation).
+    seg_probs = softmax_numpy(seg_logits[0], axis=0)      # (C, H, W)
 
-    ctr_scores = _sigmoid(ctr[0, 0])                      # (H, W)
+    ctr_scores = sigmoid_numpy(ctr[0, 0])                 # (H, W)
 
     # Pixel-centre coordinate grids in orig image space
     scale_x = orig_w / W
@@ -401,10 +416,7 @@ class ImageFeatureExtractorV2:
         """
         self._session = onnx_session
 
-        # Combined decoder feature map -- forwarded to GNN as-is
-        self._feature_map = None   # (1, 5*F, H, W) float32
-
-        # Raw ONNX outputs for FCOS decoding
+        # Raw ONNX outputs for FCOS decoding and GNN feature input
         self._combined   = None    # (1, 5*F, H, W)
         self._reg_coarse = None    # (1, 4, H/8, W/8)
         self._ctr_coarse = None    # (1, 1, H/8, W/8)
@@ -467,9 +479,8 @@ class ImageFeatureExtractorV2:
             aug_fetmap : optional extra channel map concatenated before inference
 
         Side effects:
-            self._combined / _reg_coarse / _ctr_coarse /
+            self._combined / _logits / _reg_coarse / _ctr_coarse /
             _reg_fine / _ctr_fine    <- set from ONNX outputs
-            self._feature_map        <- alias for self._combined
             self._detections_picture / _non_picture <- reset to None
         """
         self._page_h, self._page_w = page_img.shape[:2]
@@ -508,9 +519,6 @@ class ImageFeatureExtractorV2:
         self._text_logits = out_map.get('text_logits')   # (1, 2, H, W) or None
         self._thresh_map  = out_map.get('thresh_map')    # (1, 1, H, W) or None
         self._db_map      = out_map.get('db_map')        # (1, 1, H, W) or None
-
-        # feature_map is combined + logits concatenated along channel axis
-        self._feature_map = np.concatenate([self._combined, self._logits], axis=1)
 
         # Invalidate stale detection results from the previous predict() cycle
         self._detections_picture     = None
@@ -630,14 +638,25 @@ class ImageFeatureExtractorV2:
     def get_feature_map(self):
         """
         Return the combined decoder feature map from the last predict() call.
-        The returned tensor is combined (decoder outputs) concatenated with
-        logits (segmentation class scores), so the channel count is 5*F + C
-        where F is the base filter count and C is the number of classes.
+        This is the continuous embedding output only -- it no longer
+        includes the class logits (see get_class_logits() for those).
 
         Returns:
-            np.ndarray (1, 5*F + C, H, W) float32, or None if predict() not called.
+            np.ndarray (1, 5*F, H, W) float32, or None if predict() not called.
         """
-        return self._feature_map
+        return self._combined
+
+    def get_class_logits(self):
+        """
+        Return the per-class segmentation logits from the last predict()
+        call. Raw (pre-softmax) scores; apply softmax before pooling ops
+        that expect a probability distribution (e.g. entropy, margin --
+        see roi_pooling.extract_bbox_features_by_roi_pooling).
+
+        Returns:
+            np.ndarray (1, C, H, W) float32, or None if predict() not called.
+        """
+        return self._logits
 
     def is_image_page(self, page) -> bool:
         """
@@ -923,10 +942,8 @@ class ImageFeatureExtractorV2:
         if self._db_map is not None:
             prob = self._db_map[0, 0]           # (H_feat, W_feat)  in [0, 1]
         else:
-            tl  = self._text_logits[0]          # (2, H_feat, W_feat)
-            tl  = tl - tl.max(axis=0, keepdims=True)
-            exp = np.exp(tl)
-            prob = (exp / exp.sum(axis=0, keepdims=True))[1]  # (H_feat, W_feat)
+            tl   = self._text_logits[0]         # (2, H_feat, W_feat)
+            prob = softmax_numpy(tl, axis=0)[1]  # (H_feat, W_feat)
 
         feat_h, feat_w = prob.shape
         scale_x = self._page_w / feat_w
@@ -985,10 +1002,8 @@ class ImageFeatureExtractorV2:
             )
 
         # Softmax over the 2-class axis, take class-1 (text) channel
-        tl = self._text_logits[0]                          # (2, H, W)
-        tl = tl - tl.max(axis=0, keepdims=True)
-        exp = np.exp(tl)
-        text_prob = (exp / exp.sum(axis=0, keepdims=True))[1]  # (H, W)
+        tl = self._text_logits[0]                      # (2, H, W)
+        text_prob = softmax_numpy(tl, axis=0)[1]        # (H, W)
 
         thresh_map = self._thresh_map[0, 0] if self._thresh_map is not None else None
         db_map     = self._db_map[0, 0]     if self._db_map     is not None else None

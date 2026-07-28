@@ -242,7 +242,7 @@ def get_nn_input_from_datadict(data_dict, cfg, return_nn_index=False,
 class BoxRFDGNN:
     def __init__(self, config_path=None, model_path=None, imf_model_path=None, table_grid_path=None, feature_set_name='imf+rf',
                  input_type=None, enable_inference_cache=True, use_gpu=False, use_sort=False,
-                 table_grid_model_ver='V1'):
+                 table_grid_model_ver='V4'):
         script_dir = Path(__file__).resolve().parent.parent
 
         self.feature_set_name = feature_set_name

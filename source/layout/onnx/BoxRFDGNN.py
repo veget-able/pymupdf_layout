@@ -32,6 +32,123 @@ from .DefaultSorter import DefaultSorter
 from .common_util import make_session
 
 IGNORE_FEATURE_NAMES = []
+
+
+def get_class_pair_edge_thresholds(
+        threshold_by_pair,
+        node_labels,
+        edge_index,
+        class_names,
+        base_threshold=0.55,
+):
+    """Return per-edge thresholds from unordered raw node class pairs."""
+    thresholds = np.full(edge_index.shape[1], base_threshold, dtype=np.float32)
+    if edge_index.shape[1] == 0 or not threshold_by_pair:
+        return thresholds
+
+    known_classes = set(class_names)
+    normalized = {}
+    for raw_pair, raw_threshold in threshold_by_pair.items():
+        parts = [part.strip() for part in str(raw_pair).split('<->')]
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                f"Invalid edge threshold pair {raw_pair!r}; expected 'class <-> class'"
+            )
+        unknown = set(parts) - known_classes
+        if unknown:
+            raise ValueError(
+                f"Unknown edge threshold classes {sorted(unknown)}; "
+                f"expected classes from {sorted(known_classes)}"
+            )
+        threshold = float(raw_threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                f"Invalid edge threshold {threshold} for {raw_pair!r}; expected [0, 1]"
+            )
+        normalized[tuple(sorted(parts))] = threshold
+
+    sources = edge_index[0].astype(np.int64)
+    targets = edge_index[1].astype(np.int64)
+    labels = np.asarray(class_names, dtype=object)[node_labels]
+    for position, (source, target) in enumerate(zip(sources, targets)):
+        pair = tuple(sorted((labels[source], labels[target])))
+        if pair in normalized:
+            thresholds[position] = normalized[pair]
+    return thresholds
+
+
+def get_adaptive_edge_thresholds(
+        profile,
+        node_labels,
+        node_scores,
+        edge_index,
+        bboxes,
+        class_names,
+        page_width,
+        page_height,
+        base_threshold=0.55,
+):
+    """Return one threshold per edge for an optional conservative profile."""
+    valid_profiles = {
+        'picture-gap',
+        'heading-boundary',
+        'picture-gap-heading',
+    }
+    if profile not in valid_profiles:
+        raise ValueError(
+            f"Unknown adaptive_edge_profile={profile!r}; "
+            f"expected one of {sorted(valid_profiles)}"
+        )
+
+    thresholds = np.full(edge_index.shape[1], base_threshold, dtype=np.float32)
+    if edge_index.shape[1] == 0:
+        return thresholds
+
+    sources = edge_index[0].astype(np.int64)
+    targets = edge_index[1].astype(np.int64)
+    source_names = np.asarray(class_names, dtype=object)[node_labels[sources]]
+    target_names = np.asarray(class_names, dtype=object)[node_labels[targets]]
+
+    if profile in {'picture-gap', 'picture-gap-heading'}:
+        boxes = np.asarray(bboxes, dtype=np.float32)
+        source_boxes = boxes[sources]
+        target_boxes = boxes[targets]
+        x_gap = np.maximum(
+            0.0,
+            np.maximum(source_boxes[:, 0], target_boxes[:, 0])
+            - np.minimum(source_boxes[:, 2], target_boxes[:, 2]),
+        )
+        y_gap = np.maximum(
+            0.0,
+            np.maximum(source_boxes[:, 1], target_boxes[:, 1])
+            - np.minimum(source_boxes[:, 3], target_boxes[:, 3]),
+        )
+        normalized_gap = np.maximum(
+            x_gap / max(float(page_width), 1.0),
+            y_gap / max(float(page_height), 1.0),
+        )
+        suspicious_picture_bridge = (
+            (source_names == 'picture')
+            & (target_names == 'picture')
+            & (normalized_gap >= 0.10)
+        )
+        thresholds[suspicious_picture_bridge] = 0.60
+
+    if profile in {'heading-boundary', 'picture-gap-heading'}:
+        text_like = np.isin(source_names, ['text', 'list-item'])
+        target_text_like = np.isin(target_names, ['text', 'list-item'])
+        source_heading = np.isin(source_names, ['section-header', 'title'])
+        target_heading = np.isin(target_names, ['section-header', 'title'])
+        confident_boundary = (
+            ((source_heading & target_text_like) | (target_heading & text_like))
+            & (node_scores[sources] >= 0.75)
+            & (node_scores[targets] >= 0.75)
+        )
+        thresholds[confident_boundary] = 0.65
+
+    return thresholds
+
+
 def is_inside(bbox, region, margin=10):
     """Check if bbox is within the region expanded by margin."""
     bx1, by1, bx2, by2 = bbox
@@ -1002,10 +1119,89 @@ class BoxRFDGNN:
 
             # Edge prediction
             edge_threshold = kwargs.get('edge_threshold', 0.55)
+            adaptive_edge_profile = kwargs.get('adaptive_edge_profile')
+            edge_threshold_by_pair = kwargs.get('edge_threshold_by_pair')
+            edge_threshold_selector = kwargs.get('edge_threshold_selector')
+            if adaptive_edge_profile and (edge_threshold_by_pair or edge_threshold_selector):
+                raise ValueError(
+                    "adaptive_edge_profile is mutually exclusive with pair thresholds and selectors"
+                )
             if onnx_edge_logits.size > 0:
                 exp_edge_logits = np.exp(onnx_edge_logits - np.max(onnx_edge_logits, axis=1, keepdims=True))
                 edge_probs = exp_edge_logits / np.sum(exp_edge_logits, axis=1, keepdims=True)
-                predicted_edge_labels = (edge_probs[:, 1] > edge_threshold).astype(np.int64)
+                if edge_threshold_selector:
+                    raw_groups = [
+                        {
+                            'group_bbox': [float(value) for value in bbox],
+                            'class_name': self.data_class_names[int(label)],
+                        }
+                        for bbox, label in zip(bboxes, predicted_node_label)
+                    ]
+                    node_reading_order = self.sorter.sort(
+                        page,
+                        raw_groups,
+                        [None] * len(raw_groups),
+                    )
+                    edge_thresholds = edge_threshold_selector(
+                        node_labels=predicted_node_label,
+                        node_probabilities=node_probs,
+                        node_scores=predicted_node_score,
+                        edge_probabilities=edge_probs[:, 1],
+                        edge_index=edge_index,
+                        bboxes=bboxes,
+                        custom_features=data_dict.get('custom_features', [{} for _ in bboxes]),
+                        box_types=[
+                            feature.get('box_type', 'unknown')
+                            for feature in data_dict.get(
+                                'custom_features',
+                                [{} for _ in bboxes],
+                            )
+                        ],
+                        class_names=self.data_class_names,
+                        page_width=float(page.rect.width),
+                        page_height=float(page.rect.height),
+                        page_source=getattr(getattr(page, 'parent', None), 'name', None),
+                        page_number=getattr(page, 'number', None),
+                        node_reading_order=node_reading_order,
+                        base_threshold=edge_threshold,
+                    )
+                    edge_thresholds = np.asarray(edge_thresholds, dtype=np.float32)
+                    if edge_thresholds.shape != (edge_probs.shape[0],):
+                        raise ValueError(
+                            "edge_threshold_selector must return one threshold per edge; "
+                            f"got {edge_thresholds.shape}, expected {(edge_probs.shape[0],)}"
+                        )
+                    predicted_edge_labels = (
+                        edge_probs[:, 1] > edge_thresholds
+                    ).astype(np.int64)
+                elif edge_threshold_by_pair:
+                    edge_thresholds = get_class_pair_edge_thresholds(
+                        edge_threshold_by_pair,
+                        predicted_node_label,
+                        edge_index,
+                        self.data_class_names,
+                        base_threshold=edge_threshold,
+                    )
+                    predicted_edge_labels = (
+                        edge_probs[:, 1] > edge_thresholds
+                    ).astype(np.int64)
+                elif adaptive_edge_profile:
+                    edge_thresholds = get_adaptive_edge_thresholds(
+                        adaptive_edge_profile,
+                        predicted_node_label,
+                        predicted_node_score,
+                        edge_index,
+                        bboxes,
+                        self.data_class_names,
+                        page.rect.width,
+                        page.rect.height,
+                        base_threshold=edge_threshold,
+                    )
+                    predicted_edge_labels = (
+                        edge_probs[:, 1] > edge_thresholds
+                    ).astype(np.int64)
+                else:
+                    predicted_edge_labels = (edge_probs[:, 1] > edge_threshold).astype(np.int64)
             else:
                 predicted_edge_labels = np.empty(0, dtype=np.int64)
 
@@ -1140,4 +1336,3 @@ class BoxRFDGNN:
     def to_html(self, page, skip_header_footer: bool = True) -> str:
         """Convert page layout detection result to a complete HTML document."""
         return self.html_generator.generate(page, skip_header_footer=skip_header_footer)
-

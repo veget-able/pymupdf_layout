@@ -43,11 +43,12 @@ same detector contract and chart region refiner:
 
 - `fp32` (default)
 - `weight-fp16` (FP16 weight storage with FP32 compute)
-- `full-fp16`
+- `mixed-sensitive-fp16` (FP16 convolutions and weights; sensitive reductions
+  remain FP32)
 
 ```python
 page.find_charts(variant="weight-fp16")
-page.find_charts(variant="full-fp16", providers="cuda")
+page.find_charts(variant="mixed-sensitive-fp16", providers="cuda")
 ```
 
 An explicit `model_path` remains available for models outside this registry and

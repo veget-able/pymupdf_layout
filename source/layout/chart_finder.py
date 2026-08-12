@@ -15,10 +15,12 @@ merged, charts sitting side by side are split along their shared edge, and each
 box grows to cover page primitives it only partially clips - axis labels,
 legend text, small vector marks, embedded bitmaps.
 
-`find_charts()` accepts the bundled ``fp32``, ``weight-fp16`` and ``full-fp16``
-variants. Sessions are cached per model, provider list and device for the
-lifetime of the process. All variants use the same page rendering, score
-filtering and region refinement path.
+`find_charts()` accepts the bundled ``fp32``, ``weight-fp16`` and
+``mixed-sensitive-fp16`` variants. The mixed-precision model keeps sensitive
+reductions in FP32 while using FP16 convolutions and weights. Sessions are
+cached per model, provider list and device for the lifetime of the process. All
+variants use the same page rendering, score filtering and region refinement
+path.
 """
 
 import threading
@@ -36,7 +38,8 @@ MODEL_PATH = Path(__file__).resolve().parent / 'resources' / 'onnx' / 'chart_fin
 MODEL_VARIANTS = {
     'fp32': MODEL_PATH,
     'weight-fp16': MODEL_PATH.with_name('chart_finder_weight_fp16.onnx'),
-    'full-fp16': MODEL_PATH.with_name('chart_finder_full_fp16.onnx'),
+    'mixed-sensitive-fp16': MODEL_PATH.with_name(
+        'chart_finder_mixed_sensitive_fp16.onnx'),
 }
 
 INPUT_SIZE = 640            # the model input is fixed at 640x640
@@ -92,7 +95,7 @@ def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
     model_path : an alternative chart_finder.onnx. Mutually exclusive with
                  ``variant``.
     variant    : bundled model variant: ``fp32`` (the default),
-                 ``weight-fp16`` or ``full-fp16``.
+                 ``weight-fp16`` or ``mixed-sensitive-fp16``.
 
     Returns
     -------

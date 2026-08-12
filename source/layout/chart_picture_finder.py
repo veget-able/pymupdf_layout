@@ -1,10 +1,12 @@
 """Two-class Chart/Picture detection with shared chart refinement.
 
-This module bundles the DP0 FP32, weight-FP16 and full-FP16 ONNX variants.
-Chart detections use the same refinement implementation as ``chart_finder``.
-Picture detections retain their detector geometry, except that a proposal
-containing two or more smaller Picture proposals is suppressed as an oversized
-detector parent. A single containment relation is preserved.
+This module bundles the DP0 FP32, weight-FP16 and mixed-sensitive-FP16 ONNX
+variants. The mixed-precision model keeps sensitive reductions in FP32 while
+using FP16 convolutions and weights. Chart detections use the same refinement
+implementation as ``chart_finder``. Picture detections retain their detector
+geometry, except that a proposal containing two or more smaller Picture
+proposals is suppressed as an oversized detector parent. A single containment
+relation is preserved.
 """
 
 from pathlib import Path
@@ -24,8 +26,8 @@ MODEL_VARIANTS = {
     'fp32': MODEL_PATH,
     'weight-fp16': MODEL_PATH.with_name(
         'chart_picture_finder_weight_fp16.onnx'),
-    'full-fp16': MODEL_PATH.with_name(
-        'chart_picture_finder_full_fp16.onnx'),
+    'mixed-sensitive-fp16': MODEL_PATH.with_name(
+        'chart_picture_finder_mixed_sensitive_fp16.onnx'),
 }
 CLASS_NAMES = {0: 'chart', 1: 'picture'}
 MAX_DETECTIONS_PER_CLASS = 100
@@ -46,9 +48,9 @@ def find_chart_pictures(
     """Detect and refine Chart/Picture regions on one page.
 
     ``variant`` accepts ``fp32`` (the default), ``weight-fp16`` or
-    ``full-fp16``. An explicit ``model_path`` is also accepted and is mutually
-    exclusive with ``variant``. No precision variant requires a separate
-    enable flag.
+    ``mixed-sensitive-fp16``. An explicit ``model_path`` is also accepted and
+    is mutually exclusive with ``variant``. No precision variant requires a
+    separate enable flag.
 
     Returns a dictionary with separate ``chart`` and ``picture`` lists. Each
     list item contains ``bbox``, ``score`` and ``label``.

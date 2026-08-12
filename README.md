@@ -39,12 +39,13 @@ three independently selectable ONNX variants:
 
 - `fp32` (default)
 - `weight-fp16` (FP16 weight storage with FP32 compute)
-- `full-fp16`
+- `mixed-sensitive-fp16` (FP16 convolutions and weights; sensitive reductions
+  remain FP32)
 
 ```python
 from pymupdf.layout.chart_picture_finder import find_chart_pictures
 
-detections = find_chart_pictures(page, variant="full-fp16")
+detections = find_chart_pictures(page, variant="mixed-sensitive-fp16")
 charts = detections["chart"]
 pictures = detections["picture"]
 ```

@@ -1,0 +1,30 @@
+{
+  "role": "chart_picture_finder_dp0",
+  "architecture": "PP-YOLOE+_s",
+  "input_shape": [1, 3, 640, 640],
+  "classes": {"0": "chart", "1": "picture"},
+  "public_inputs": ["image", "scale_factor"],
+  "runtime_policy": "user_selectable",
+  "refiners": {
+    "chart": "pymupdf.layout.chart_finder._refine",
+    "picture": "multi-child-parent-suppression"
+  },
+  "variants": {
+    "fp32": {
+      "file": "chart_picture_finder.onnx",
+      "precision": "fp32",
+      "sha256": "1993b1479cd0bc561d75937279471e01f9ebe4f43bc13ffc3476f55ef8a2af37"
+    },
+    "weight-fp16": {
+      "file": "chart_picture_finder_weight_fp16.onnx",
+      "precision": "fp16_weight_storage_fp32_compute",
+      "sha256": "9a303e30f3553dbd62e89c1a9a5f212f47b4d2e002f360f2b9de55e27ec90023"
+    },
+    "full-fp16": {
+      "file": "chart_picture_finder_full_fp16.onnx",
+      "precision": "full_fp16_compute_fp32_public_io",
+      "sha256": "4ad29a35d4f632b9092f0bf0309dd0f52483799117829eddac9d35a843568f1d",
+      "observation": "Prior package validation observed CPU/CUDA synthetic output-count divergence; selection is intentionally not blocked."
+    }
+  }
+}

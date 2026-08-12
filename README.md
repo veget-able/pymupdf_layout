@@ -32,10 +32,14 @@ While other tools train machine learning models on rendered page images, PyMuPDF
 
 **PyMuPDF Layout** is used by [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm) to analyze documents and deliver improved results.
 
-### Chart finder precision variants
+### Finder combinations
 
-The chart finder bundles three user-selectable ONNX variants. They share the
-same detector contract and the same chart region refiner:
+This branch combines the Graph Cut hooks with both finder registries. D0 and
+DP0 remain alternative detector modes; including both APIs does not run both
+models on a page.
+
+The D0 chart finder bundles three user-selectable ONNX variants. They share the
+same detector contract and chart region refiner:
 
 - `fp32` (default)
 - `weight-fp16` (FP16 weight storage with FP32 compute)
@@ -48,6 +52,21 @@ page.find_charts(variant="full-fp16", providers="cuda")
 
 An explicit `model_path` remains available for models outside this registry and
 is mutually exclusive with `variant`.
+
+The DP0 two-class finder provides the same three precision choices:
+
+```python
+from pymupdf.layout.chart_picture_finder import find_chart_pictures
+
+detections = find_chart_pictures(page, variant="full-fp16")
+charts = detections["chart"]
+pictures = detections["picture"]
+```
+
+Chart detections use the existing chart finder refiner. Picture proposals keep
+their detector geometry, with only a multi-child oversized-parent suppression;
+single containment pairs are preserved. No precision variant has a separate
+enable gate.
 
 
 ## Documentation

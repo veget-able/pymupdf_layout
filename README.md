@@ -59,7 +59,7 @@ The DP0 two-class finder provides the same three precision choices:
 ```python
 from pymupdf.layout.chart_picture_finder import find_chart_pictures
 
-detections = find_chart_pictures(page, variant="full-fp16")
+detections = find_chart_pictures(page, variant="mixed-sensitive-fp16")
 charts = detections["chart"]
 pictures = detections["picture"]
 ```

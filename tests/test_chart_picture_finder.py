@@ -9,7 +9,7 @@ def test_bundled_chart_picture_variants_exist():
     assert set(chart_picture_finder.MODEL_VARIANTS) == {
         "fp32",
         "weight-fp16",
-        "full-fp16",
+        "mixed-sensitive-fp16",
     }
     for variant in chart_picture_finder.MODEL_VARIANTS:
         path = chart_picture_finder.model_path_for_variant(variant)
@@ -17,11 +17,11 @@ def test_bundled_chart_picture_variants_exist():
         assert path.is_file()
 
 
-def test_full_fp16_has_no_separate_enable_gate():
+def test_mixed_sensitive_fp16_has_no_separate_enable_gate():
     assert chart_picture_finder._resolve_model_path(
         model_path=None,
-        variant="full-fp16",
-    ) == chart_picture_finder.MODEL_VARIANTS["full-fp16"]
+        variant="mixed-sensitive-fp16",
+    ) == chart_picture_finder.MODEL_VARIANTS["mixed-sensitive-fp16"]
 
 
 def test_explicit_model_and_variant_are_mutually_exclusive():

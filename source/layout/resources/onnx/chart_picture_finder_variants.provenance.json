@@ -20,11 +20,18 @@
       "precision": "fp16_weight_storage_fp32_compute",
       "sha256": "9a303e30f3553dbd62e89c1a9a5f212f47b4d2e002f360f2b9de55e27ec90023"
     },
-    "full-fp16": {
-      "file": "chart_picture_finder_full_fp16.onnx",
-      "precision": "full_fp16_compute_fp32_public_io",
-      "sha256": "4ad29a35d4f632b9092f0bf0309dd0f52483799117829eddac9d35a843568f1d",
-      "observation": "Prior package validation observed CPU/CUDA synthetic output-count divergence; selection is intentionally not blocked."
+    "mixed-sensitive-fp16": {
+      "file": "chart_picture_finder_mixed_sensitive_fp16.onnx",
+      "precision": "mixed_sensitive_fp16_compute_fp32_public_io",
+      "sha256": "a3b9333921a53ef26c3b25997497bf6e972365d7b44640b9a57bef7634267f49",
+      "source_fp32_sha256": "1993b1479cd0bc561d75937279471e01f9ebe4f43bc13ffc3476f55ef8a2af37",
+      "conversion_policy": {
+        "conv_fp16": 86,
+        "global_average_pool_fp32": 3,
+        "reduce_mean_fp32": 4,
+        "softmax_fp32": 3
+      },
+      "validation": "ONNX checker plus finite CPU/CUDA inference and PDF entrypoint passed"
     }
   }
 }

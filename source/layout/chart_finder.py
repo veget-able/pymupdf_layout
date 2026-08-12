@@ -15,8 +15,10 @@ merged, charts sitting side by side are split along their shared edge, and each
 box grows to cover page primitives it only partially clips - axis labels,
 legend text, small vector marks, embedded bitmaps.
 
-`find_charts()` is the only public name.  Sessions are cached per model, provider
-list and device for the lifetime of the process.
+`find_charts()` accepts the bundled ``fp32``, ``weight-fp16`` and ``full-fp16``
+variants. Sessions are cached per model, provider list and device for the
+lifetime of the process. All variants use the same page rendering, score
+filtering and region refinement path.
 """
 
 import threading
@@ -28,9 +30,14 @@ import pymupdf
 from .common_util import compute_iou as _iou
 from .onnx.common_util import make_session
 
-__version__ = '260730'
+__version__ = '260812'
 
 MODEL_PATH = Path(__file__).resolve().parent / 'resources' / 'onnx' / 'chart_finder.onnx'
+MODEL_VARIANTS = {
+    'fp32': MODEL_PATH,
+    'weight-fp16': MODEL_PATH.with_name('chart_finder_weight_fp16.onnx'),
+    'full-fp16': MODEL_PATH.with_name('chart_finder_full_fp16.onnx'),
+}
 
 INPUT_SIZE = 640            # the model input is fixed at 640x640
 RENDER_LONG_SIDE = 1024     # page raster long side, before the resize to INPUT_SIZE
@@ -68,7 +75,7 @@ _sessions_lock = threading.Lock()
 
 
 def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
-                model_path=None):
+                model_path=None, variant=None):
     """
     Detect chart regions on one page.
 
@@ -82,7 +89,10 @@ def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
                  or a sequence of aliases and/or full provider names.  Providers
                  the runtime does not offer are dropped, falling back to CPU.
     device_id  : GPU ordinal, used by the CUDA and TensorRT providers.
-    model_path : an alternative chart_finder.onnx, for evaluating a new model.
+    model_path : an alternative chart_finder.onnx. Mutually exclusive with
+                 ``variant``.
+    variant    : bundled model variant: ``fp32`` (the default),
+                 ``weight-fp16`` or ``full-fp16``.
 
     Returns
     -------
@@ -96,6 +106,7 @@ def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
     if device_id < 0:
         raise ValueError('device_id must be non-negative')
 
+    model_path = _resolve_model_path(model_path=model_path, variant=variant)
     session = _session(model_path, providers, device_id)
     page, owner = _upright(page)
     try:
@@ -109,6 +120,27 @@ def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
 
 
 # ---------------------------------------------------------------- runtime ----
+
+def model_path_for_variant(variant='fp32'):
+    """Return the bundled ONNX path for a named precision variant."""
+    try:
+        path = MODEL_VARIANTS[str(variant)]
+    except KeyError as exc:
+        raise ValueError(
+            f'unknown chart finder variant {variant!r}; '
+            f'expected one of {sorted(MODEL_VARIANTS)}') from exc
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _resolve_model_path(*, model_path, variant):
+    if model_path is not None and variant is not None:
+        raise ValueError('model_path and variant are mutually exclusive')
+    if model_path is not None:
+        return Path(model_path).expanduser().resolve()
+    return model_path_for_variant(variant or 'fp32')
+
 
 def _session(model_path, providers, device_id):
     """Return a cached InferenceSession for this model/provider/device."""

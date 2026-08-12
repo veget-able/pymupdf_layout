@@ -32,8 +32,24 @@ While other tools train machine learning models on rendered page images, PyMuPDF
 
 **PyMuPDF Layout** is used by [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm) to analyze documents and deliver improved results.
 
+### Chart finder precision variants
+
+The chart finder bundles three user-selectable ONNX variants. They share the
+same detector contract and the same chart region refiner:
+
+- `fp32` (default)
+- `weight-fp16` (FP16 weight storage with FP32 compute)
+- `full-fp16`
+
+```python
+page.find_charts(variant="weight-fp16")
+page.find_charts(variant="full-fp16", providers="cuda")
+```
+
+An explicit `model_path` remains available for models outside this registry and
+is mutually exclusive with `variant`.
+
 
 ## Documentation
 
 **PyMuPDF Layout** is a component of [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm), see the [PyMuPDF4LLM documentation page](https://pymupdf.readthedocs.io/en/latest/pymupdf4llm)
-

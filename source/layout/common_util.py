@@ -793,6 +793,147 @@ def group_node_by_edge(
     return groups
 
 
+PICTURE_SEMANTIC_SPLIT_PROFILES = {
+    "all-text-section": {
+        "families": {"text", "section"},
+        "classes": None,
+        "min_class_probability": None,
+    },
+    "confident-text-section": {
+        "families": {"text", "section"},
+        "classes": None,
+        "min_class_probability": 0.5,
+    },
+    "confident-core-text-section": {
+        "families": {"text", "section"},
+        "classes": {"text", "section-header"},
+        "min_class_probability": 0.5,
+    },
+    "section-only": {
+        "families": {"section"},
+        "classes": None,
+        "min_class_probability": None,
+    },
+}
+
+
+def _picture_semantic_family(class_name: str) -> str:
+    if class_name in {"text", "list-item", "footnote", "caption", "formula"}:
+        return "text"
+    if class_name in {"title", "section-header"}:
+        return "section"
+    if class_name == "picture":
+        return "picture"
+    return class_name
+
+
+def add_picture_semantic_child_groups(
+        groups: List[Dict],
+        node_cls: np.ndarray,
+        node_score: np.ndarray,
+        node_probabilities: np.ndarray,
+        edge_matrix: np.ndarray,
+        bboxes: List[List[float]],
+        label_priority_list: List[int],
+        class_names: List[str],
+        profile: str,
+) -> List[Dict]:
+    """Retain Picture parents and expose confident Text/Section subcomponents.
+
+    The GNN assigns node classes before accepted edges form components.  A
+    component-level Picture majority can therefore hide Text/Section nodes.
+    This opt-in post-grouping view keeps the original Picture group intact,
+    cuts accepted edges at semantic-family boundaries inside that parent, and
+    appends only the requested textual child components.
+
+    The confident profiles use the natural probability decision boundary: the
+    mean probability of the child's majority class must be at least 0.5.
+    ``confident-core-text-section`` further limits the emitted raw classes to
+    ``text`` and ``section-header``.  No benchmark annotation, page-density
+    threshold, or Chart detector is consulted.
+    """
+    if profile not in PICTURE_SEMANTIC_SPLIT_PROFILES:
+        raise ValueError(
+            f"Unknown picture_semantic_split_profile={profile!r}; expected one of "
+            f"{sorted(PICTURE_SEMANTIC_SPLIT_PROFILES)}"
+        )
+
+    node_cls = np.asarray(node_cls)
+    node_score = np.asarray(node_score)
+    node_probabilities = np.asarray(node_probabilities)
+    edge_matrix = np.asarray(edge_matrix)
+    bboxes_arr = np.asarray(bboxes, dtype=np.float32)
+    num_nodes = len(node_cls)
+    if node_probabilities.shape[0] != num_nodes:
+        raise ValueError("node_probabilities must have one row per node")
+    if edge_matrix.shape != (num_nodes, num_nodes):
+        raise ValueError("edge_matrix must be square with one row per node")
+    if len(bboxes_arr) != num_nodes:
+        raise ValueError("bboxes must have one row per node")
+
+    config = PICTURE_SEMANTIC_SPLIT_PROFILES[profile]
+    requested_families = config["families"]
+    requested_classes = config["classes"]
+    min_class_probability = config["min_class_probability"]
+    class_names_arr = np.asarray(class_names, dtype=object)
+    node_class_names = class_names_arr[node_cls]
+    node_families = np.asarray(
+        [_picture_semantic_family(str(name)) for name in node_class_names],
+        dtype=object,
+    )
+
+    output = []
+    for parent_group_index, parent in enumerate(groups):
+        output.append(parent)
+        parent_class = class_names[int(parent["group_class"])]
+        if parent_class != "picture":
+            continue
+        parent_indices = np.asarray(parent["indicies"], dtype=np.int64)
+        if parent_indices.size == 0:
+            continue
+
+        for family in ("text", "section"):
+            if family not in requested_families:
+                continue
+            family_mask = node_families[parent_indices] == family
+            if requested_classes is not None:
+                family_mask &= np.isin(
+                    node_class_names[parent_indices],
+                    list(requested_classes),
+                )
+            family_indices = parent_indices[family_mask]
+            if family_indices.size == 0:
+                continue
+            family_edge_matrix = edge_matrix[np.ix_(family_indices, family_indices)]
+            child_groups = group_node_by_edge(
+                node_cls[family_indices],
+                node_score[family_indices],
+                family_edge_matrix,
+                bboxes_arr[family_indices],
+                label_priority_list,
+            )
+            for child in child_groups:
+                local_indices = np.asarray(child["indicies"], dtype=np.int64)
+                global_indices = family_indices[local_indices]
+                child_class = int(child["group_class"])
+                mean_class_probability = float(
+                    np.mean(node_probabilities[global_indices, child_class])
+                )
+                if (
+                    min_class_probability is not None
+                    and mean_class_probability < min_class_probability
+                ):
+                    continue
+                child["indicies"] = global_indices.tolist()
+                child["class_name"] = class_names[child_class]
+                child["semantic_family"] = family
+                child["semantic_parent_group_index"] = parent_group_index
+                child["semantic_split_profile"] = profile
+                child["mean_class_probability"] = mean_class_probability
+                output.append(child)
+    return output
+
+
 def extract_bbox_features_by_roi_align(
         features: np.ndarray,
         bboxes: List[Tuple[float, float, float, float]],

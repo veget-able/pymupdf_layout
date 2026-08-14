@@ -9,6 +9,7 @@ from pathlib import Path
 from ..common_util import (get_boxes_transform, get_edge_by_knn,
                            get_edge_transform_bbox,
                            get_text_pattern, get_edge_matrix, group_node_by_edge,
+                           add_picture_semantic_child_groups,
                            resize_image, compute_iou)
 from ..roi_pooling import (extract_bbox_features_by_roi_pooling,
                            RoiPoolingSession,
@@ -1213,6 +1214,10 @@ class BoxRFDGNN:
             for group in groups:
                 group['class_name'] = self.data_class_names[group['group_class']]
 
+            picture_semantic_split_profile = kwargs.get(
+                'picture_semantic_split_profile'
+            )
+
         # If groups were loaded from cache or newly generated, proceed with post-processing.
         # Note: If groups were from cache, they already went through the initial post-processing
         # but further operations like sorting or table grid extraction might re-run based on flags.
@@ -1246,6 +1251,26 @@ class BoxRFDGNN:
             order      = self.sorter.sort(page, groups, det_result)
             groups     = [groups[i]     for i in order]
             det_result = [det_result[i] for i in order]
+
+        # Add overlapping semantic children only after native post-processing.
+        # Parent Picture geometry must not depend on whether this optional view
+        # is enabled (notably post-seg image refinement and Picture merging).
+        if picture_semantic_split_profile:
+            groups = add_picture_semantic_child_groups(
+                groups=groups,
+                node_cls=predicted_node_label,
+                node_score=predicted_node_score,
+                node_probabilities=node_probs,
+                edge_matrix=edge_matrix,
+                bboxes=bboxes,
+                label_priority_list=self.class_priority_list,
+                class_names=self.data_class_names,
+                profile=picture_semantic_split_profile,
+            )
+            det_result = [
+                group['group_bbox'][:] + [group['class_name']]
+                for group in groups
+            ]
             
         # Enrich groups with class name and table structure
         # This block is moved here to ensure table grid extraction happens after

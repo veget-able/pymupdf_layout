@@ -82,6 +82,16 @@ def test_confident_profile_filters_child_below_probability_half():
     ]
 
 
+def test_all_profile_keeps_argmax_child_below_probability_half():
+    groups = _split("all-text-section", text_probability=0.49)
+
+    assert [group["class_name"] for group in groups] == [
+        "picture",
+        "text",
+        "section-header",
+    ]
+
+
 def test_section_profile_does_not_emit_text_family():
     groups = _split("section-only")
 
@@ -133,3 +143,94 @@ def test_core_profile_excludes_caption_children():
     )
 
     assert [group["class_name"] for group in groups] == ["picture", "text"]
+
+
+def test_all_profile_keeps_caption_and_list_item_classes():
+    values = list(_inputs())
+    values[1] = np.array([1, 1, 5, 3], dtype=np.int64)
+    values[3][2] = np.array([0.05, 0.10, 0.05, 0.05, 0.05, 0.45])
+    values[3][3] = np.array([0.05, 0.10, 0.05, 0.45, 0.05, 0.05])
+    values[4][2, 3] = values[4][3, 2] = 0
+    groups = add_picture_semantic_child_groups(
+        groups=values[0],
+        node_cls=values[1],
+        node_score=values[2],
+        node_probabilities=values[3],
+        edge_matrix=values[4],
+        bboxes=values[5],
+        label_priority_list=PRIORITY,
+        class_names=CLASS_NAMES,
+        profile="all-text-section",
+    )
+
+    assert [group["class_name"] for group in groups] == [
+        "picture",
+        "caption",
+        "list-item",
+    ]
+
+
+def test_family_posterior_recovers_text_when_subclass_mass_exceeds_picture():
+    values = list(_inputs())
+    # Node 2 is hard-Picture, but Text + Caption is the stronger semantic
+    # family. Node 3 is hard-Caption and connected to it.
+    values[1] = np.array([1, 1, 1, 5], dtype=np.int64)
+    values[3][2] = np.array([0.30, 0.46, 0.01, 0.01, 0.01, 0.21])
+    values[3][3] = np.array([0.20, 0.20, 0.01, 0.01, 0.01, 0.56])
+    groups = add_picture_semantic_child_groups(
+        groups=values[0],
+        node_cls=values[1],
+        node_score=values[2],
+        node_probabilities=values[3],
+        edge_matrix=values[4],
+        bboxes=values[5],
+        label_priority_list=PRIORITY,
+        class_names=CLASS_NAMES,
+        profile="all-text-section-family-posterior",
+    )
+
+    assert [group["class_name"] for group in groups] == ["picture", "text"]
+    assert groups[1]["indicies"] == [2, 3]
+    assert groups[1]["semantic_family"] == "text"
+    assert groups[1]["semantic_family_assignment"] == "posterior-sum"
+
+
+def test_seeded_family_posterior_extends_existing_caption_seed():
+    values = list(_inputs())
+    values[1] = np.array([1, 1, 1, 5], dtype=np.int64)
+    values[3][2] = np.array([0.30, 0.46, 0.01, 0.01, 0.01, 0.21])
+    values[3][3] = np.array([0.20, 0.20, 0.01, 0.01, 0.01, 0.56])
+    groups = add_picture_semantic_child_groups(
+        groups=values[0],
+        node_cls=values[1],
+        node_score=values[2],
+        node_probabilities=values[3],
+        edge_matrix=values[4],
+        bboxes=values[5],
+        label_priority_list=PRIORITY,
+        class_names=CLASS_NAMES,
+        profile="all-text-section-family-posterior-seeded",
+    )
+
+    assert [group["class_name"] for group in groups] == ["picture", "text"]
+    assert groups[1]["indicies"] == [2, 3]
+
+
+def test_seeded_family_posterior_does_not_initiate_from_all_picture_hard_nodes():
+    values = list(_inputs())
+    values[1] = np.array([1, 1, 1, 1], dtype=np.int64)
+    values[3][2] = np.array([0.30, 0.46, 0.01, 0.01, 0.01, 0.21])
+    values[3][3] = np.array([0.30, 0.46, 0.01, 0.01, 0.01, 0.21])
+    groups = add_picture_semantic_child_groups(
+        groups=values[0],
+        node_cls=values[1],
+        node_score=values[2],
+        node_probabilities=values[3],
+        edge_matrix=values[4],
+        bboxes=values[5],
+        label_priority_list=PRIORITY,
+        class_names=CLASS_NAMES,
+        profile="all-text-section-family-posterior-seeded",
+    )
+
+    assert [group["class_name"] for group in groups] == ["picture"]

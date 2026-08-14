@@ -798,21 +798,43 @@ PICTURE_SEMANTIC_SPLIT_PROFILES = {
         "families": {"text", "section"},
         "classes": None,
         "min_class_probability": None,
+        "family_assignment": "hard-class",
+        "require_hard_family_seed": False,
+    },
+    "all-text-section-family-posterior": {
+        "families": {"text", "section"},
+        "classes": None,
+        "min_class_probability": None,
+        "family_assignment": "posterior-sum",
+        "require_hard_family_seed": False,
+    },
+    "all-text-section-family-posterior-seeded": {
+        "families": {"text", "section"},
+        "classes": None,
+        "min_class_probability": None,
+        "family_assignment": "posterior-sum",
+        "require_hard_family_seed": True,
     },
     "confident-text-section": {
         "families": {"text", "section"},
         "classes": None,
         "min_class_probability": 0.5,
+        "family_assignment": "hard-class",
+        "require_hard_family_seed": False,
     },
     "confident-core-text-section": {
         "families": {"text", "section"},
         "classes": {"text", "section-header"},
         "min_class_probability": 0.5,
+        "family_assignment": "hard-class",
+        "require_hard_family_seed": False,
     },
     "section-only": {
         "families": {"section"},
         "classes": None,
         "min_class_probability": None,
+        "family_assignment": "hard-class",
+        "require_hard_family_seed": False,
     },
 }
 
@@ -846,11 +868,25 @@ def add_picture_semantic_child_groups(
     cuts accepted edges at semantic-family boundaries inside that parent, and
     appends only the requested textual child components.
 
-    The confident profiles use the natural probability decision boundary: the
-    mean probability of the child's majority class must be at least 0.5.
-    ``confident-core-text-section`` further limits the emitted raw classes to
-    ``text`` and ``section-header``.  No benchmark annotation, page-density
-    threshold, or Chart detector is consulted.
+    The ``all-text-section-family-posterior`` profiles first sum posterior
+    probability across semantic families. This prevents probability split
+    among Text subclasses (for example Text and Caption) from making Picture
+    win solely because it is a single class. The winning raw class inside that
+    family is still selected by the model posterior, and the existing accepted
+    graph edges still define child connectivity.
+
+    The ``*-seeded`` variant uses the posterior only to complete an accepted
+    component that already contains at least one hard Text/Section-family
+    node. It cannot initiate a new textual child from an all-Picture hard
+    component, so isolated labels are not exposed merely by probability mass.
+
+    The ``confident-*`` profiles are retained as historical ablations: they
+    require the mean probability of the child's majority class to be at least
+    0.5.  That value is not a natural decision boundary for this multiclass
+    model; the hard class has already won an argmax and can legitimately have
+    probability below 0.5. ``confident-core-text-section`` further limits the
+    emitted raw classes to ``text`` and ``section-header``. No benchmark
+    annotation, page-density threshold, or Chart detector is consulted.
     """
     if profile not in PICTURE_SEMANTIC_SPLIT_PROFILES:
         raise ValueError(
@@ -866,6 +902,8 @@ def add_picture_semantic_child_groups(
     num_nodes = len(node_cls)
     if node_probabilities.shape[0] != num_nodes:
         raise ValueError("node_probabilities must have one row per node")
+    if node_probabilities.shape[1] != len(class_names):
+        raise ValueError("node_probabilities must have one column per class")
     if edge_matrix.shape != (num_nodes, num_nodes):
         raise ValueError("edge_matrix must be square with one row per node")
     if len(bboxes_arr) != num_nodes:
@@ -875,12 +913,49 @@ def add_picture_semantic_child_groups(
     requested_families = config["families"]
     requested_classes = config["classes"]
     min_class_probability = config["min_class_probability"]
+    family_assignment = config["family_assignment"]
+    require_hard_family_seed = config["require_hard_family_seed"]
     class_names_arr = np.asarray(class_names, dtype=object)
-    node_class_names = class_names_arr[node_cls]
-    node_families = np.asarray(
-        [_picture_semantic_family(str(name)) for name in node_class_names],
+    class_families = np.asarray(
+        [_picture_semantic_family(str(name)) for name in class_names_arr],
         dtype=object,
     )
+    semantic_node_cls = node_cls.copy()
+    semantic_node_scores = np.asarray(node_score).copy()
+    hard_node_families = class_families[node_cls]
+    node_families = hard_node_families.copy()
+    if family_assignment == "posterior-sum":
+        family_order = list(dict.fromkeys(class_families.tolist()))
+        family_class_ids = {
+            family: np.flatnonzero(class_families == family)
+            for family in family_order
+        }
+        assigned_families = []
+        for node_index, probabilities in enumerate(node_probabilities):
+            family_scores = {
+                family: float(np.sum(probabilities[class_ids]))
+                for family, class_ids in family_class_ids.items()
+            }
+            max_score = max(family_scores.values())
+            tied_families = [
+                family
+                for family in family_order
+                if np.isclose(family_scores[family], max_score)
+            ]
+            hard_family = str(class_families[int(node_cls[node_index])])
+            winning_family = (
+                hard_family if hard_family in tied_families else tied_families[0]
+            )
+            assigned_families.append(winning_family)
+            candidate_ids = family_class_ids[winning_family]
+            semantic_node_cls[node_index] = int(
+                candidate_ids[np.argmax(probabilities[candidate_ids])]
+            )
+        node_families = np.asarray(assigned_families, dtype=object)
+        semantic_node_scores = node_probabilities[
+            np.arange(num_nodes), semantic_node_cls
+        ]
+    semantic_node_class_names = class_names_arr[semantic_node_cls]
 
     output = []
     for parent_group_index, parent in enumerate(groups):
@@ -898,7 +973,7 @@ def add_picture_semantic_child_groups(
             family_mask = node_families[parent_indices] == family
             if requested_classes is not None:
                 family_mask &= np.isin(
-                    node_class_names[parent_indices],
+                    semantic_node_class_names[parent_indices],
                     list(requested_classes),
                 )
             family_indices = parent_indices[family_mask]
@@ -906,8 +981,8 @@ def add_picture_semantic_child_groups(
                 continue
             family_edge_matrix = edge_matrix[np.ix_(family_indices, family_indices)]
             child_groups = group_node_by_edge(
-                node_cls[family_indices],
-                node_score[family_indices],
+                semantic_node_cls[family_indices],
+                semantic_node_scores[family_indices],
                 family_edge_matrix,
                 bboxes_arr[family_indices],
                 label_priority_list,
@@ -915,6 +990,10 @@ def add_picture_semantic_child_groups(
             for child in child_groups:
                 local_indices = np.asarray(child["indicies"], dtype=np.int64)
                 global_indices = family_indices[local_indices]
+                if require_hard_family_seed and not np.any(
+                    hard_node_families[global_indices] == family
+                ):
+                    continue
                 child_class = int(child["group_class"])
                 mean_class_probability = float(
                     np.mean(node_probabilities[global_indices, child_class])
@@ -929,6 +1008,7 @@ def add_picture_semantic_child_groups(
                 child["semantic_family"] = family
                 child["semantic_parent_group_index"] = parent_group_index
                 child["semantic_split_profile"] = profile
+                child["semantic_family_assignment"] = family_assignment
                 child["mean_class_probability"] = mean_class_probability
                 output.append(child)
     return output

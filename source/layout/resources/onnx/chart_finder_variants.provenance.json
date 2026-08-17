@@ -1,0 +1,33 @@
+{
+  "role": "chart_finder_d0",
+  "architecture": "PP-YOLOE+_s",
+  "input_shape": [1, 3, 640, 640],
+  "public_inputs": ["image", "scale_factor"],
+  "runtime_policy": "user_selectable",
+  "refiner": "pymupdf.layout.chart_finder._refine",
+  "variants": {
+    "fp32": {
+      "file": "chart_finder.onnx",
+      "precision": "fp32",
+      "sha256": "18f1df3ddba43bfdf741f86d16b0ba04080a9f40cbb47a3f25f7da1a059c0b7e"
+    },
+    "weight-fp16": {
+      "file": "chart_finder_weight_fp16.onnx",
+      "precision": "fp16_weight_storage_fp32_compute",
+      "sha256": "4ab0406463279703015d8d4b66894d5b0a64814d87558112fd91ea063abb4016"
+    },
+    "mixed-sensitive-fp16": {
+      "file": "chart_finder_mixed_sensitive_fp16.onnx",
+      "precision": "mixed_sensitive_fp16_compute_fp32_public_io",
+      "sha256": "909c2f2a42d325a0a306cdbd392ea3935dbb24eba3a384221f26e78d2fc1507f",
+      "source_fp32_sha256": "18f1df3ddba43bfdf741f86d16b0ba04080a9f40cbb47a3f25f7da1a059c0b7e",
+      "conversion_policy": {
+        "conv_fp16": 86,
+        "global_average_pool_fp32": 3,
+        "reduce_mean_fp32": 4,
+        "softmax_fp32": 3
+      },
+      "validation": "ONNX checker plus finite CPU/CUDA inference and PDF entrypoint passed"
+    }
+  }
+}

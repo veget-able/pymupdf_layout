@@ -58,3 +58,61 @@ def test_picture_refiner_preserves_single_containment_pair():
     assert len(boxes) == 2
     assert scores == [0.9, 0.8]
     assert stats["parents_removed"] == 0
+
+
+def test_dp0_preserves_chart_detector_bbox_without_second_detection(monkeypatch):
+    calls = {"detect": 0}
+
+    class Session:
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    monkeypatch.setattr(
+        chart_picture_finder,
+        "_resolve_model_path",
+        lambda **_kwargs: Path("model.onnx"),
+    )
+    monkeypatch.setattr(
+        chart_picture_finder.chart_finder,
+        "_session",
+        lambda *_args: Session(),
+    )
+    monkeypatch.setattr(
+        chart_picture_finder.chart_finder,
+        "_upright",
+        lambda page: (page, None),
+    )
+
+    def detect(_page, _session, _thresholds):
+        calls["detect"] += 1
+        return {
+            "chart": {
+                "boxes": [[10.0, 10.0, 40.0, 40.0]],
+                "scores": [0.9],
+            },
+            "picture": {
+                "boxes": [[50.0, 50.0, 70.0, 70.0]],
+                "scores": [0.8],
+            },
+        }
+
+    monkeypatch.setattr(chart_picture_finder, "_detect", detect)
+    monkeypatch.setattr(
+        chart_picture_finder.chart_finder,
+        "_refine",
+        lambda _page, _boxes, scores: (
+            [[8.0, 8.0, 44.0, 44.0]],
+            scores,
+        ),
+    )
+
+    result = chart_picture_finder.find_chart_pictures(
+        object(),
+        variant="fp32",
+        include_detector_bbox=True,
+    )
+
+    assert calls["detect"] == 1
+    assert result["chart"][0]["bbox"] == [8.0, 8.0, 44.0, 44.0]
+    assert result["chart"][0]["detector_bbox"] == [10.0, 10.0, 40.0, 40.0]
+    assert result["picture"][0]["bbox"] == [50.0, 50.0, 70.0, 70.0]

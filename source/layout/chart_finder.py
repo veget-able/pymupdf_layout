@@ -78,7 +78,7 @@ _sessions_lock = threading.Lock()
 
 
 def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
-                model_path=None, variant=None):
+                model_path=None, variant=None, include_detector_bbox=False):
     """
     Detect chart regions on one page.
 
@@ -96,6 +96,9 @@ def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
                  ``variant``.
     variant    : bundled model variant: ``fp32`` (the default),
                  ``weight-fp16`` or ``mixed-sensitive-fp16``.
+    include_detector_bbox : include the pre-refinement model box in each item
+                 as ``detector_bbox``. This reuses the same inference; it does
+                 not invoke the detector again.
 
     Returns
     -------
@@ -114,9 +117,13 @@ def find_charts(page, *, threshold=0.5, providers=None, device_id=0,
     page, owner = _upright(page)
     try:
         boxes, scores = _detect(page, session, float(threshold))
+        detector_boxes = [list(box) for box in boxes]
         boxes, scores = _refine(page, boxes, scores)
-        return [{'bbox': tuple(box), 'score': score}
-                for box, score in zip(boxes, scores)]
+        items = [{'bbox': tuple(box), 'score': score}
+                 for box, score in zip(boxes, scores)]
+        if include_detector_bbox:
+            _attach_detector_boxes(items, detector_boxes)
+        return items
     finally:
         if owner is not None:
             owner.close()
@@ -244,6 +251,33 @@ def _detect(page, session, threshold):
             boxes.append(box)
             scores.append(round(float(row[1]), 6))
     return boxes, scores
+
+
+def _attach_detector_boxes(items, detector_boxes):
+    """Attach a pre-refinement detector box to every refined result.
+
+    Refinement can grow, split, deduplicate and reorder boxes. Match each final
+    result to the still-available raw box with the highest IoU, using the
+    smaller raw area only as a deterministic tie-break. This preserves the
+    detector's visual core without another model invocation.
+    """
+    available = [list(map(float, box[:4])) for box in detector_boxes or []]
+    for item in items:
+        refined = item.get('bbox') or item.get('box')
+        if refined is None or not available:
+            continue
+        best_index = max(
+            range(len(available)),
+            key=lambda index: (
+                _iou(refined, available[index]),
+                -abs(
+                    (available[index][2] - available[index][0])
+                    * (available[index][3] - available[index][1])
+                ),
+            ),
+        )
+        item.setdefault('detector_bbox', available.pop(best_index))
+    return items
 
 
 def _render(page):

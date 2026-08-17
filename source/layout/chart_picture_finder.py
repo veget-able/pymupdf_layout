@@ -44,6 +44,7 @@ def find_chart_pictures(
         device_id=0,
         model_path=None,
         variant=None,
+        include_detector_bbox=False,
 ):
     """Detect and refine Chart/Picture regions on one page.
 
@@ -53,7 +54,9 @@ def find_chart_pictures(
     separate enable flag.
 
     Returns a dictionary with separate ``chart`` and ``picture`` lists. Each
-    list item contains ``bbox``, ``score`` and ``label``.
+    list item contains ``bbox``, ``score`` and ``label``. When
+    ``include_detector_bbox`` is true, Chart items also contain the
+    pre-refinement model box. It is captured from the same inference.
     """
     thresholds = {
         0: _threshold(chart_threshold, 'chart_threshold'),
@@ -79,8 +82,14 @@ def find_chart_pictures(
                 raw['picture']['scores'],
             )
         )
+        chart_items = _items('chart', chart_boxes, chart_scores)
+        if include_detector_bbox:
+            chart_finder._attach_detector_boxes(
+                chart_items,
+                raw['chart']['boxes'],
+            )
         return {
-            'chart': _items('chart', chart_boxes, chart_scores),
+            'chart': chart_items,
             'picture': _items('picture', picture_boxes, picture_scores),
             'model_variant': selected_variant,
             'model_path': str(model_path),

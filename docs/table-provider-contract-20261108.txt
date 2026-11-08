@@ -1,0 +1,7 @@
+Active layout provider contract for table consumers
+
+The active native model is borrowed through get_active_model without constructing a second analyzer. Explicit custom providers are scoped through use_provider, validated by get_active_provider, and restore the previous hook and provider after success or exceptions.
+
+The CNN adapter borrows the actual public Stage1/Stage2/grid sessions, validates page, geometry, OCR and prepared-input identity, and binds retained table-grid predictions to the table runtime. It does not supply synthetic logits or mutate the source model. No weights or model defaults are replaced.
+
+These two source files are byte-identical to the frozen P02 source map 75a0f81025e20db3ca52b96ea3e879b19afa863f08626b71741e847afbcaf752. P02 RF/CNN PB503 and DL6489 results are reference validation of the unchanged implementation; clean assembled-branch API reproduction is recorded separately.
